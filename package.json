@@ -1,0 +1,8 @@
+{
+    "dependencies": {
+        "crypto": "^1.0.1",
+        "libsodium-wrappers": "^0.7.5",
+        "posix-pipe-fork-exec": "git+https://github.com/codetsunami/posix-pipe-fork-exec.git",
+        "ws": "^7.1.2"
+    }
+}
