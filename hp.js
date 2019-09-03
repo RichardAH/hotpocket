@@ -249,6 +249,9 @@ function open_listen() {
     ram.peer_server.on('connection', on_peer_connection)
     ram.peer_server.on('close', on_peer_close)
 
+    var ws_self = new ws_api('ws://0.0.0.0:'+node.peerport)
+    ws_self.on('open',((w)=>{return ()=>{on_peer_connection(w)}})(ws_self))        
+    
     if (node.pubport) {
         ram.public_server = new ws_api.Server({ port: node.pubport });
         ram.public_server.on('connection', on_public_connection)
@@ -514,6 +517,17 @@ function consensus() {
     if (ram.consensus.possible_input_dict == undefined) ram.consensus.possible_input_dict = {}
     if (ram.consensus.possible_output_dict == undefined) ram.consensus.possible_output_dict = {}
     
+    /**
+        A proposal is a json object consisting of 5 sections
+        Connections (for this round)
+            only include connections we have directly in stage 0
+        Inputs      (for this round)
+            only include inputs we have directly in stage 0
+        Outputs     (from last round)
+            only include outputs we have directly in stage 0
+        State       (from last round)
+        LastCloseed (from last round)
+    **/
 
     proposal = {
         hotpocket: HP_VERSION,
@@ -532,32 +546,6 @@ function consensus() {
 
         case 0: // in stage 0 we create a novel proposal and broadcast it
         {
-           
-            /**
-                A proposal is a json object consisting of 5 sections
-                Connections (for this round)
-                    only include connections we have directly in stage 0
-                Inputs      (for this round)
-                    only include inputs we have directly in stage 0
-                Outputs     (from last round)
-                    only include outputs we have directly in stage 0
-                State       (from last round)
-                LastCloseed (from last round)
-            **/
-
-            proposal = {
-                hotpocket: HP_VERSION,
-                type: 'proposal',
-                pubkey: node.pubkeyhex,
-                timestamp: time
-                con: [],
-                inp: {},
-                out: [],
-                sta: "",
-                lcl: "",
-                stage: 0
-            }
-
             var pending_inputs = ram.local_pending_inputs
             ram.local_pending_inputs = {}
 
@@ -701,6 +689,40 @@ function consensus() {
     // finally send the proposal to peers
     broadcast_to_peers(proposal_msg) 
 
+
+    if (ram.consensus.stage == 3) {
+        // we've reached the end of a consensus round
+        // so we need to apply inputs, collect outputs
+        // and clear buffers, and assign unused inputs to next round
+
+        // structure we need to provide to the contract binary run routine:
+        // { user_pub_key: [ stream of raw input or empty if no input is available ] }
+        // every connected user must have an entry
+
+        var concrete_inputs = {}
+        for (var i in proposal.inp) {
+            var hash = proposal.inp[i]
+            if (!ram.consensus.possible_input_dict[hash]) {
+                warn('input required ' + hash + ' but it wasn\'t in our possible input dict, this will cause desync')
+                continue //todo: consider making this fatal
+            }
+
+            for (var j in ram.consensus.possible_input_dict[hash]) {
+                // there'll be just the one key
+                concrete_inputs[j] = ram.consensus.possible_input_dict[hash][j]
+                break
+            }
+        }
+
+        //todo: check contract state against consensus
+        //todo: check lcl against consensus
+
+
+        // this will gather outputs into the appropriate place as they become available
+        //todo: finish
+        run_contract_binary(concrete_inputs)
+
+    }
 
     ram.consensus.stage = (ram.consensus.stage + 1) % 4  
 }
