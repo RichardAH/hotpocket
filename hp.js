@@ -1,12 +1,27 @@
-const sodium = require('libsodium-wrappers')
-const fs = require('fs')
 const HP_VERSION = 0.1
+const fs = require('fs')
+const ws_api = require('ws');
+const sodium = require('libsodium-wrappers')
+const crypto = require('crypto')
+
 
 // sodium has a trigger when it's ready, we will wait and execute from there
 sodium.ready.then(main).catch((e)=>{console.log(e)})
 
-// datastructure representing all globals for this node
+// datastructure representing all valid config for this node
 node = {}
+
+// namespace for all working variables
+ram = {}
+
+
+// first half of sha512 with t prepended before hashing
+function SHA512H(m, t) {
+    if (t == undefined) t = ''
+    if (typeof(m) == 'object') m = JSON.stringify(m)
+    m = t + '' + m
+    return crypto.createHash('sha512').update(m).digest('hex').slice(0,16) 
+}
 
 // print a message to stdout then quit
 function die(message, zero_exit) {
@@ -64,7 +79,11 @@ function create_contract() {
         keytype: keys.keyType,
         binary: 'bin/contract',
         peers: [],
-        unl: [sodium.to_hex(keys.publicKey)]
+        unl: [sodium.to_hex(keys.publicKey)],
+        ip: '0.0.0.0',
+        pubport: '8080',
+        peerport: '22860',
+        roundtime: '1000'
     }    
 
     fs.writeFileSync(node.dir + '/cfg/hp.cfg', JSON.stringify(config, null, 2))
@@ -183,13 +202,128 @@ function load_contract() {
     node.unl = []
     for (var i in config.unl)
         node.unl.push(Buffer.from(config.unl[i], 'hex'))
+
+    // check ip
+    if (!config.ip || !config.ip.match(/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/))
+        die(
+            'contract config does not specify ip to bind to or specified ip is invalid,\n' + 
+            'try "ip": "0.0.0.0" to bind all interfaces'
+        )
+    node.ip = config.ip
  
+    // check ports
+    if (!config.peerport) die('contract config must specify peer port, try: "peerport": 22860')
+    if (!config.pubport) warn('contract config does not specify a public port, the public will not have access')
+
+    if (config.pubport) node.pubport = config.pubport
+    node.peerport = config.peerport
+
     // todo: check state
     // todo: check history
 
     // execution to here = all config loaded successfully
 }
 
+function open_listen() {
+    ram.peer_server = new ws_api.Server({ port: node.peerport });
+    if (node.pubport) ram.public_server = new ws_api.Server({ port: node.pubport });
+
+    ram.peer_server.on('connection', on_peer_connection)
+    if (node.pubport) ram.public_server.on('connection', on_public_connection)
+
+    ram.peer_connections = {}
+    ram.public_connections = {}
+
+    // contains a dict comprising SHA512H -> time received
+    ram.recent_peer_msghash = {}
+}
+
+
+function on_peer_connection(ws) {
+    //todo: filter to by ip ensure peer is on peer list
+    ws.on('message', on_peer_message)
+}
+
+function on_public_connection(ws) {
+    if (!node.pubport) die('received a public connection even though public port was not specified')
+    //todo: filter by abuse/ip here to stop ddos
+    ws.on('message', on_public_message)
+}
+
+function on_peer_message(message) {
+    var time = Date.now()
+
+    // convert the message to json
+    // this is cheap so do this first
+    var msg = {}
+    try {
+        msg = JSON.parse(message)
+    } catch(e) {
+        //todo: disconnect peer for sending bad messages here
+        warn('bad message from peer')
+        return
+    }
+    
+    
+    // check if the peer is on our UNL
+    // this is also pretty cheap so do this second
+    var valid_peer = false
+    if (msg.pubkey)
+    for (var i in node.unl)
+        if (msg.pubkey == node.unl[i]) {
+            valid_peer = true
+            break
+        }
+    
+    if (!valid_peer) {
+        warn('received peer message from peer not on our UNL')
+        //todo: block non-unl peers
+        return
+    }
+   
+    // check timestamp on message 
+    if (msg.timestamp < time/1000.0 - node.roundtime * 4)
+        return warn('received message from peer but it was old')
+
+    // if the message is valid json and has a pub key we'll hash it and check if we've seen it before
+    // but first we need to prune the signature from it
+    var sig = msg.sig
+    delete msg.sig
+    var msgnosig = JSON.stringify(msg, Object.keys(msg).sort())
+    // todo: check for further malleability attacks here
+    var msghash = SHA512H(msgnosig, 'PEERMSG')
+    
+    // check if we've seen this message before
+    if (ram.recent_peer_msghash.msghash) return
+
+    // place an entry into the cache
+    ram.recent_peer_msghash[msghash] = time
+
+    // prune old message hash cache
+    // todo: put this on a timer for much better performance
+    for (var i in ram.recent_peer_msghash)
+        if (ram.recent_peer_msghash[i] < time - 60)
+            delete ram.recent_peer_msghash[i]
+
+
+    // check the signature 
+    // this is pretty expensive
+    if (!sodium.crypto_sign_verify_detached(sig, msgnosig, Buffer.from(msg.pubkey, 'hex')))
+        return warn('received bad signature from peer') // todo: punish peer
+
+    // execution to here is a valid peer message
+
+    // check what sort of message it is
+    if (msg.type == 'proposal') {
+        ram.proposals[msghash] = msg.proposal
+    } 
+
+}
+
+function on_public_message(message) {
+    var msghash = SHA512H(message, 'PUBMSG')
+
+}
 
 // hotpocket controller entry point
 function main() {
@@ -199,7 +333,10 @@ function main() {
 
     // load config
     load_contract()
-    
+   
+    // start listening for peers
+    open_listen()
+ 
     // connect to peers
     open_peer_connections()
 
