@@ -3,6 +3,8 @@ const fs = require('fs')
 const ws_api = require('ws');
 const sodium = require('libsodium-wrappers')
 const crypto = require('crypto')
+const pipe = require('posix-pipe-fork-exec')
+const readline = require('readline')
 
 
 // sodium has a trigger when it's ready, we will wait and execute from there
@@ -34,6 +36,9 @@ function warn(message) {
     console.log("WARN: " + message)
 }
 
+// helper from https://stackoverflow.com/questions/56134298/is-there-a-way-to-get-all-keys-inside-of-an-object-including-sub-objects
+const get_all_keys = obj => Object.keys(obj).flatMap(k => Object(obj[k]) === obj[k] ? [k, ...get_all_keys(obj[k])] : k).sort()
+
 function process_cmdline(argv) {
 
     var flags = {}
@@ -55,6 +60,7 @@ function process_cmdline(argv) {
         )
     
     node.dir = argv[2]
+    
    
     if (flags.n) create_contract()
     else if (flags.k) rekey_contract()
@@ -78,6 +84,7 @@ function create_contract() {
         seckey: sodium.to_hex(keys.privateKey),
         keytype: keys.keyType,
         binary: 'bin/contract',
+        binargs: '',
         peers: [],
         unl: [sodium.to_hex(keys.publicKey)],
         ip: '0.0.0.0',
@@ -171,6 +178,10 @@ function load_contract() {
     if (!fs.existsSync(node.dir + '/' + config.binary)) die('contract binary not found at ' + node.dir + '/' + config.binary)
     node.binary = config.binary
 
+    // check if bin args are specified
+    node.binargs = ( config.binargs ? config.binargs.split(' ') : [] )
+    
+
     // check peer array
     if (typeof(config.peers) != 'object' || typeof(config.peers.length) != 'number')
         die('contract config lacks valid peers array e.g. "peers": ["127.0.0.1:10001", ...]')
@@ -208,7 +219,7 @@ function load_contract() {
     // parse UNL keys
     node.unl = []
     for (var i in config.unl)
-        node.unl.push(Buffer.from(config.unl[i], 'hex'))
+        node.unl.push( { buf: Buffer.from(config.unl[i], 'hex'), hex: config.unl[i] })
 
     // check ip
     if (!config.ip || !config.ip.match(/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/))
@@ -258,26 +269,6 @@ function open_listen() {
         ram.public_server.on('close', on_public_close)
     }
 
-    // IP:PORT -> ws for all peers
-    ram.peer_connections = {}
-
-    // IP:PORT -> ws for all public connections that haven't passed challenge
-    ram.public_connections_unauthed = {}
-
-    // IP:PORT;pubkeyhex -> ws for all public connections that have passed challenge
-    ram.public_connections_authed = {}
-
-    // IP:PORT;pubkeyhex -> [ ordered list of input packets ]
-    // these are any messages we've received from authed public connections
-    // that haven't yet been placed into a proposal
-    ram.local_pending_inputs = {}
-
-    // as above however they have been placed into a proposal and are waiting for validation
-    ram.local_pending_inputs_old = {}
-
-
-    // contains a dict comprising SHA512H -> time received
-    ram.recent_peer_msghash = {}
 }
 
 // scans peers continuously attempting to maintain peer connections if they drop
@@ -330,6 +321,8 @@ function on_peer_connection(ws) {
     ws.on('message', on_peer_message)
 }
 
+//todo: handle public disconnection
+
 
 function on_public_connection(ws) {
 
@@ -341,9 +334,9 @@ function on_public_connection(ws) {
         hotpocket: HP_VERSION,
         type: "public_challenge",
         challenge: challenge
-    })
+    }))
     ws._challenge = challenge 
-    ws.on('message', function (message) => {
+    ws.on('message', (message) => {
         // all we want here is an auth message, once they have managed that
         // we'll move them to the public authed group
 
@@ -371,11 +364,14 @@ function on_public_connection(ws) {
         if (!msg.pubkey)
             return warn('unauthed public node sent message lacking pub key')
 
-        if (!sodium.crypto_sign_verify_detached(msg.sig, msg.challenge, 
-                Buffer.from(msg.pubkey, 'hex'))
-            )
-            return warn('received bad signature from unauthed pub node')
-        
+        try {
+            if (!sodium.crypto_sign_verify_detached(Buffer.from(msg.sig, 'hex'), msg.challenge, 
+                    Buffer.from(msg.pubkey, 'hex'))
+                ) throw null
+        } catch (e) {
+            if (e) warn(e)
+            return warn('received bad signature from unauthed pub node ')
+        }
         // execution to here means the node has authed
         delete ram.public_connections_unauthed[ws._socket.remoteAddress + ":" + ws._socket.remotePort]
         var authed = ws._socket.remoteAddress + ":" + ws._socket.remotePort + ";" + msg.pubkey
@@ -388,12 +384,15 @@ function on_public_connection(ws) {
         ws._start = Date.now()/1000
         ws._msgcount = 0
 
+        dbg(ws._pubkey + " was authed")
+
         // change where this socket's messages are routed to now
         ws.on('message', (message) => {
             ws._msgcount++
             if (message.length > node.pubmaxsize) return warn('received oversized authed public message')
-            if ((Date.now() - ws._start) / ws._msgcount) return warn('received too many messages from authed public user')
-            if (!ram.local_pending_inputs[ws._authed]) return warn('received authed message from a websocket without an _authed prop')
+            if ((Date.now()/1000 - ws._start) / ws._msgcount > node.pubmaxcpm) return warn('received too many messages from authed public user: '+ ws._msgcount + " time alive: " + (Date.now()/1000 - ws._start))
+            if (!ws._authed) return warn('received authed message from a websocket without an _authed prop')
+            if (!ram.local_pending_inputs[ws._authed]) ram.local_pending_inputs[ws._authed] = []
             ram.local_pending_inputs[ws._authed].push(message)
         })
     })
@@ -431,14 +430,15 @@ function on_peer_message(message) {
     // this is also pretty cheap so do this second
     var valid_peer = false
     if (msg.pubkey)
-    for (var i in node.unl)
-        if (msg.pubkey == node.unl[i]) {
+    for (var i in node.unl) {
+        if (msg.pubkey == node.unl[i].hex) {
             valid_peer = true
             break
         }
+    }
     
     if (!valid_peer) {
-        warn('received peer message from peer not on our UNL')
+        warn('received peer message from peer not on our UNL pk = ' + msg.pubkey)
         //todo: block non-unl peers
         return
     }
@@ -451,25 +451,36 @@ function on_peer_message(message) {
     // but first we need to prune the signature from it
     var sig = msg.sig
     delete msg.sig
-    var msgnosig = JSON.stringify(msg, Object.keys(msg).sort())
+    var msgnosig = JSON.stringify(msg, get_all_keys(msg))
+
+
     // todo: check for further malleability attacks here
     var msghash = SHA512H(msgnosig, 'PEERMSG')
-    
+
     // check if we've seen this message before
-    if (ram.recent_peer_msghash.msghash) return
+    if (ram.recent_peer_msghash[msghash]) return
 
     // place an entry into the cache
     ram.recent_peer_msghash[msghash] = time
 
+
     // check the signature 
     // this is pretty expensive
-    if (!sodium.crypto_sign_verify_detached(sig, msgnosig, Buffer.from(msg.pubkey, 'hex')))
+    try {
+        if (!sodium.crypto_sign_verify_detached(Buffer.from(sig, 'hex'), msgnosig, Buffer.from(msg.pubkey, 'hex')))
+            throw null
+    } catch(e) {
+        if (e) warn(e)
         return warn('received bad signature from peer') // todo: punish peer
-
+    }
     // execution to here is a valid peer message
 
+    var msgkeys = Object.keys(msg)
+
+    const required_fields = [ 'con', 'inp', 'out', 'lcl', 'stage', 'timestamp', 'type' ]
+
     // check what sort of message it is
-    if (msg.type == 'proposal' && msg.con && msg.inp && msg.out && msg.lcl && msg.stage) {
+    if (msg.type == 'proposal' && msgkeys.includes(...required_fields)) {
         ram.proposals[msghash] = msg
         // broadcast it to our peers
         broadcast_to_peers(message)
@@ -506,7 +517,7 @@ function consensus() {
     var start = time % node.roundtime*4
     if (ram.consensus.stage == 0 && start > 50) {
         ram.consensus.nextsleep = 1
-        dbg('sleeping... waiting to join consensus ' + start + ' | ' + time + ' | ' + ram.consensus.nextsleep) 
+        //dbg('sleeping... waiting to join consensus ' + start + ' | ' + time + ' | ' + ram.consensus.nextsleep) 
         return
     }
 
@@ -514,9 +525,6 @@ function consensus() {
     ram.consensus.nextsleep = node.roundtime - 200
     dbg('ready ' + time + " nextsleep = " + ram.consensus.nextsleep)
 
-    if (ram.consensus.possible_input_dict == undefined) ram.consensus.possible_input_dict = {}
-    if (ram.consensus.possible_output_dict == undefined) ram.consensus.possible_output_dict = {}
-    
     /**
         A proposal is a json object consisting of 5 sections
         Connections (for this round)
@@ -533,10 +541,10 @@ function consensus() {
         hotpocket: HP_VERSION,
         type: 'proposal',
         pubkey: node.pubkeyhex,
-        timestamp: time
+        timestamp: time,
         con: [],
-        inp: [],
-        out: [],
+        inp: {},
+        out: {},
         sta: "",
         lcl: "",
         stage: ram.consensus.stage
@@ -551,17 +559,20 @@ function consensus() {
 
             for (var i in ram.public_connections_authed) {
                 // add all the connections we host (mentioned by their public key only)
-                proposal.con.push(i.replace(/^.+;/,''))
+                var user = i.replace(/^.+;/,'')
+                proposal.con.push(user)
 
                 // and all their pending messages
                 if (pending_inputs[i] && pending_inputs[i].length > 0) {
-                    proposal.inp[i] = []
+
+                    proposal.inp[user] = []
                     for (var j in pending_inputs[i]) {
                         var user_input = pending_inputs[i][j]
-                        proposal.inp[i].push(user_input)
-            
+                        proposal.inp[user].push(sodium.to_hex(user_input)) //push(user_input)
+ 
                         //todo: old inputs need to be stripped from this object when consensus round closes
                         //any that didn't make it into the Nth round need to make it into N+1
+                        if (!ram.local_pending_inputs_old[i]) ram.local_pending_inputs_old[i] = []
                         ram.local_pending_inputs_old[i].push(user_input)
                     }
                 }
@@ -571,8 +582,7 @@ function consensus() {
             // todo: gather and propose state
             // todo: gather and propose lcl
 
-
-            break;
+            break
         }
 
         case 1:
@@ -596,13 +606,17 @@ function consensus() {
             for (var i in proposals) {
                 var p = proposals[i]
 
+
+
                 inc(votes.sta, p.sta)
     
                 inc(votes.lcl, p.lcl)
 
                 for (var j in p.con)
                     inc(votes.con, p.con[j])
-                
+   
+                console.log("considering prop:") 
+                console.log(JSON.stringify(p, null, 2))            
                 for (var j in p.inp) {
                     // inputs are processed as a hash of the JSON of the proposed input
                     var hash = ""
@@ -627,7 +641,7 @@ function consensus() {
                     if (typeof(p.out[j]) == "object") {
                         // this is a full output proposal, so we need to hash it
                         var possible_output = {j: p.out[j]}
-                        hash = SHA512H(JSON.stringify(possible_output), 'INPUT')
+                        hash = SHA512H(JSON.stringify(possible_output), 'OUTPUT')
                         ram.consensus.possible_output_dict[hash] = possible_output
                     } else {
                         // this is already a hash
@@ -636,6 +650,8 @@ function consensus() {
 
                     inc(votes.out, hash)
                 }
+
+                delete proposal[i]
             }
 
 
@@ -678,16 +694,23 @@ function consensus() {
             
     }
 
+
+
+
     // to sign we need to first JSON stringify it in a key sorted fashion
-    var proposal_msg_unsigned = JSON.stringify(proposal, Object.keys(msg).sort())
+    var proposal_msg_unsigned = JSON.stringify(proposal, get_all_keys(proposal))
+
     // create the signature
-    var sig = sodium.crypto_sign_detached(proposal_msg_unsigned, node.seckeybuf)
+    var sig = sodium.to_hex(sodium.crypto_sign_detached(proposal_msg_unsigned, node.seckeybuf))
+    
     // then add the signature to the message and stringify it again
     proposal.sig = sig
-    var proposal_msg = JSON.stringify(proposal, Object.keys(msg).sort())
+    var proposal_msg = JSON.stringify(proposal, get_all_keys(proposal))
 
     // finally send the proposal to peers
     broadcast_to_peers(proposal_msg) 
+
+    dbg("sending prop: " + proposal_msg)
 
 
     if (ram.consensus.stage == 3) {
@@ -698,6 +721,9 @@ function consensus() {
         // structure we need to provide to the contract binary run routine:
         // { user_pub_key: [ stream of raw input or empty if no input is available ] }
         // every connected user must have an entry
+
+        console.log("possible input dict")
+        console.log(JSON.stringify(ram.consensus.possible_input_dict, null, 2))
 
         var concrete_inputs = {}
         for (var i in proposal.inp) {
@@ -727,6 +753,89 @@ function consensus() {
     ram.consensus.stage = (ram.consensus.stage + 1) % 4  
 }
 
+function run_contract_binary(inputs) {
+
+    var childpipesflat  = []     // pipes.childread, pipes.childwrite ]
+    var parentpipesflat = []    // pipes.parentread, pipes.parentwrite ]
+
+    // pubkeyhex -> {parentwrite:, parentread:} 
+    var outputpipes = {}
+
+    var fdlist = "HOTPOCKET " + HP_VERSION + "\n"
+
+    for (var user in inputs) {
+        var pipes = pipe.PipeDuplex()
+
+        childpipesflat.push(pipes.childread)
+        childpipesflat.push(pipes.childwrite)
+
+        parentpipesflat.push(pipes.parentread)
+        parentpipesflat.push(pipes.parentwrite)
+
+        var parentsockets = pipe.PipeSockets( [ pipes.parentread, pipes.parentwrite ] )
+        outputpipes[user] = parentsockets[0]
+
+        // queue up the input on each of the pipes
+        for (var i in inputs[user])
+            parentsockets[1].write(inputs[user][i])
+
+        // compile a list of pipes and users to provide to the contract as stdin
+        fdlist += user + "=" + pipes.childread + ":" + pipes.childwrite + "\n"
+
+    }
+
+    var bin = [ node.binary ]
+    for (var i in node.binargs) bin.push(node.binargs[i])
+
+    dbg('Contract Execution: ' + bin)
+
+    var stdout = pipe.rawforkexecclose(childpipesflat, parentpipesflat, bin, fdlist, node.dir)
+
+    console.log("stdout of contract: \n" + stdout)
+
+}
+
+
+function init_ram() {
+
+
+
+    ram.proposals = {}
+
+    // IP:PORT -> ws for all peers
+    ram.peer_connections = {}
+
+    // IP:PORT -> ws for all public connections that haven't passed challenge
+    ram.public_connections_unauthed = {}
+
+    // IP:PORT;pubkeyhex -> ws for all public connections that have passed challenge
+    ram.public_connections_authed = {}
+
+    // IP:PORT;pubkeyhex -> [ ordered list of input packets ]
+    // these are any messages we've received from authed public connections
+    // that haven't yet been placed into a proposal
+    ram.local_pending_inputs = {}
+
+    // as above however they have been placed into a proposal and are waiting for validation
+    ram.local_pending_inputs_old = {}
+
+
+    // contains a dict comprising SHA512H -> time received
+    ram.recent_peer_msghash = {}
+    
+    // ram.consensus contains all transient state information about consensus 
+    ram.consensus = {}
+
+    // this is a dictionary mapping hashes of inputs to actual inputs
+    // in the first stage of proposal full inputs are gossiped
+    // in subsequent stages of proposal only the hash is gossiped
+    ram.consensus.possible_input_dict = {}
+
+    // as above
+    ram.consensus.possible_output_dict = {}
+    
+
+}
 
 // hotpocket controller entry point
 function main() {
@@ -736,7 +845,10 @@ function main() {
 
     // load config
     load_contract()
-   
+  
+    // set up working structures
+    init_ram()
+ 
     // start listening for peers
     open_listen()
  
@@ -747,7 +859,6 @@ function main() {
     prune_cache_watchdog()
 
     // do consensus rounds!
-    ram.consensus = {}
     ram.consensus.stage = 0
     var consensus_round_timer = ()=>{ 
             consensus()
