@@ -57,7 +57,7 @@ function main() {
             
             var f= ()=>{ rl.question('', (answer) => {
                     console.log("sending: " + answer)
-                    ws.send(answer)
+                    ws.send(answer + "\n")
                     f()
                 })}
             f()

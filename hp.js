@@ -543,8 +543,8 @@ function consensus() {
         pubkey: node.pubkeyhex,
         timestamp: time,
         con: [],
-        inp: {},
-        out: {},
+        inp: [],
+        out: [],
         sta: "",
         lcl: "",
         stage: ram.consensus.stage
@@ -556,6 +556,16 @@ function consensus() {
         {
             var pending_inputs = ram.local_pending_inputs
             ram.local_pending_inputs = {}
+
+            // change inp and out to objects for stage 0
+            // once full versions of inputs and outputs have been circulated
+            // only their hashes are voted upon, and these are kept in arrays
+            // for the avoidance of doubt: stage 0 proposals have inp, out as objects
+            // mapping user_public_key_hex -> [an array of the user's inputs]
+            // stage 1..3 proposals have an array e.g.
+            // inp = [ hash_of_user_1_inputs, hash_of_user_2_inputs, .. ]
+            proposal.inp = {}
+            proposal.out = {}
 
             for (var i in ram.public_connections_authed) {
                 // add all the connections we host (mentioned by their public key only)
@@ -592,6 +602,7 @@ function consensus() {
             var proposals = ram.proposals
             ram.proposals = {}
 
+            
             //todo: tally all the connections, inputs, outputs, state, lcl, from all proposals
             // and then propose a new proposal based on those tallies
 
@@ -615,14 +626,13 @@ function consensus() {
                 for (var j in p.con)
                     inc(votes.con, p.con[j])
    
-                console.log("considering prop:") 
-                console.log(JSON.stringify(p, null, 2))            
                 for (var j in p.inp) {
                     // inputs are processed as a hash of the JSON of the proposed input
                     var hash = ""
                     if (typeof(p.inp[j]) == "object") {
                         // this is a full input proposal, so we need to hash it
-                        var possible_input = {j: p.inp[j]}
+                        var possible_input = {}
+                        possible_input[j] = p.inp[j]
                         hash = SHA512H(JSON.stringify(possible_input), 'INPUT')
                         ram.consensus.possible_input_dict[hash] = possible_input
 
@@ -710,7 +720,7 @@ function consensus() {
     // finally send the proposal to peers
     broadcast_to_peers(proposal_msg) 
 
-    dbg("sending prop: " + proposal_msg)
+    //dbg("sending prop: " + proposal_msg)
 
 
     if (ram.consensus.stage == 3) {
@@ -735,10 +745,18 @@ function consensus() {
 
             for (var j in ram.consensus.possible_input_dict[hash]) {
                 // there'll be just the one key
-                concrete_inputs[j] = ram.consensus.possible_input_dict[hash][j]
+                var inputshex = ram.consensus.possible_input_dict[hash][j]
+                var inputsbuf = []
+                for (var k in inputshex)
+                    inputsbuf[k] = Buffer.from(inputshex[k], 'hex')
+                
+                concrete_inputs[j] = inputsbuf
                 break
             }
         }
+
+        console.log('concrete_inputs: ')
+        console.log(concrete_inputs)
 
         //todo: check contract state against consensus
         //todo: check lcl against consensus
