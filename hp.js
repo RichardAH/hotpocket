@@ -335,8 +335,34 @@ function on_public_connection(ws) {
         type: "public_challenge",
         challenge: challenge
     }))
-    ws._challenge = challenge 
+    ws._challenge = challenge
+
+    ws.on('close', () => {
+
+        if (ws._authed) {
+            delete ram.public_connections_authed[ws._authed]
+            return
+        }
+
+        delete ram.public_connections_unauthed[ws._socket.remoteAddress + ":" + ws._socket.remotePort]
+
+    })
+ 
     ws.on('message', (message) => {
+
+        // this handles authorized transactions
+        if (ws._authed) {
+
+            ws._msgcount++
+            if (message.length > node.pubmaxsize) return warn('received oversized authed public message')
+            if ((Date.now()/1000 - ws._start) / ws._msgcount > node.pubmaxcpm) return warn('received too many messages from authed public user: '+ ws._msgcount + " time alive: " + (Date.now()/1000 - ws._start))
+            if (!ws._authed) return warn('received authed message from a websocket without an _authed prop')
+            if (!ram.local_pending_inputs[ws._authed]) ram.local_pending_inputs[ws._authed] = []
+            ram.local_pending_inputs[ws._authed].push(message)
+            
+            return
+        }
+
         // all we want here is an auth message, once they have managed that
         // we'll move them to the public authed group
 
@@ -386,15 +412,6 @@ function on_public_connection(ws) {
 
         dbg(ws._pubkey + " was authed")
 
-        // change where this socket's messages are routed to now
-        ws.on('message', (message) => {
-            ws._msgcount++
-            if (message.length > node.pubmaxsize) return warn('received oversized authed public message')
-            if ((Date.now()/1000 - ws._start) / ws._msgcount > node.pubmaxcpm) return warn('received too many messages from authed public user: '+ ws._msgcount + " time alive: " + (Date.now()/1000 - ws._start))
-            if (!ws._authed) return warn('received authed message from a websocket without an _authed prop')
-            if (!ram.local_pending_inputs[ws._authed]) ram.local_pending_inputs[ws._authed] = []
-            ram.local_pending_inputs[ws._authed].push(message)
-        })
     })
 }
 
@@ -671,7 +688,10 @@ function consensus() {
                     var hash = ""
                     if (typeof(p.out[j]) == "object") {
                         // this is a full output proposal, so we need to hash it
-                        var possible_output = p.out[j]
+
+                        dbg("p.out[j] = ", p.out[j])
+                        var possible_output = {}
+                        possible_output[j] = p.out[j]
                         hash = SHA512H(JSON.stringify(possible_output), 'OUTPUT')
                         ram.consensus.possible_output_dict[hash] = possible_output
                     } else {
@@ -749,15 +769,53 @@ function consensus() {
         // so we need to apply inputs, collect outputs
         // and clear buffers, and assign unused inputs to next round
 
+        dbg("proposal.out", proposal.out)
+
+        dbg('ram.consensus.possible_output_dict',  ram.consensus.possible_output_dict[hash])
+
+        // first send out any relevant output from the previous consensus round and execution
+        for (var i in proposal.out) {
+            var hash = proposal.out[i]
+
+            if (!ram.consensus.possible_output_dict[hash]) {
+                warn('output required ' + hash + ' but wasn\'t in our possible output dict, this will potentially cause desync')
+                continue // todo: consider fatal
+            }
+
+
+
+            for (var user in ram.consensus.possible_output_dict[hash]) {
+                // there'll be just the one key
+
+                var output = ram.consensus.possible_output_dict[hash][user]
+                try {
+                    output = Buffer.from(''+output, 'hex').toString()
+                } catch (e) {
+                    warn('output represented by hash ' + hash + ' for user ' + user + ' was not valid hex') 
+                    continue
+                } 
+
+                dbg("found output", output)
+                
+                // check if the user is in our locally connected users
+                for (var j in ram.public_connections_authed) {
+                    if (j.replace(/^.*;/, '') == user) {
+                        // this is our locally connected user, send his contract output to him
+                        ram.public_connections_authed[j].send(output)//Uint8Array.from(Buffer.from(output, 'hex')))
+                        break
+                    }
+                }
+            }
+        }
+
+        // now we can safely clear our output dictionary
+        ram.consensus.possible_output_dict = {}
+
+
         // structure we need to provide to the contract binary run routine:
         // { user_pub_key: [ stream of raw input or empty if no input is available ] }
         // every connected user must have an entry
 
-        console.log("final stage inputs:")
-        console.log(JSON.stringify(proposal.inp, null, 2))
-
-        console.log("possible input dict")
-        console.log(JSON.stringify(ram.consensus.possible_input_dict, null, 2))
 
         var concrete_inputs = {}
 
@@ -858,7 +916,7 @@ function run_contract_binary(inputs) {
         //console.log(Buffer.from(pipe.getfdbytes(outputpipes[user])).toString())
         var out = Buffer.from(pipe.getfdbytes(outputpipes[user]))
         if (out.length >0)
-            outputs[user] = sodium.to_hex(out)
+            outputs[user] =  [sodium.to_hex(out)]
     }
 
     // close all the pipes we're finished with
