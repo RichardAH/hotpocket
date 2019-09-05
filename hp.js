@@ -500,8 +500,13 @@ function broadcast_to_peers(message) {
 }
 
 
-function dbg(m) {
-    console.log('DBG: ' + m)
+function dbg(m, o) {
+    if (typeof(o) != 'undefined') {
+        console.log('DBG: ' + m)
+        var out = JSON.stringify(o, null, 2)
+        var lines = out.split('\n')
+        for (var i in lines) console.log('     ' + lines[i])
+    } else console.log('DBG: ' + m)
 }
 
 // helper function for voting
@@ -554,8 +559,18 @@ function consensus() {
 
         case 0: // in stage 0 we create a novel proposal and broadcast it
         {
+            
+            console.log("ram.local_pending_inputs = ")
+            console.log(JSON.stringify(ram.local_pending_inputs, null, 2))
             var pending_inputs = ram.local_pending_inputs
             ram.local_pending_inputs = {}
+
+
+            // clear out the old stage 3 proposals
+            // todo: check the state of these to ensure we're running consensus ledger
+        
+            for (var p in ram.proposals) if (ram.proposals[p].stage == 3) delete ram.proposals[p] 
+
 
             // change inp and out to objects for stage 0
             // once full versions of inputs and outputs have been circulated
@@ -588,7 +603,11 @@ function consensus() {
                 }
             }
 
-            // todo: gather and propose outputs
+            // propose outputs from previous round if any
+            for (var user in ram.consensus.local_output_dict) 
+                proposal.out[user] = ram.consensus.local_output_dict[user]
+            
+
             // todo: gather and propose state
             // todo: gather and propose lcl
 
@@ -600,6 +619,10 @@ function consensus() {
         case 3:
     
             var proposals = ram.proposals
+            
+            
+            dbg("proposals", proposals)
+
             ram.proposals = {}
 
             
@@ -616,8 +639,6 @@ function consensus() {
 
             for (var i in proposals) {
                 var p = proposals[i]
-
-
 
                 inc(votes.sta, p.sta)
     
@@ -650,7 +671,7 @@ function consensus() {
                     var hash = ""
                     if (typeof(p.out[j]) == "object") {
                         // this is a full output proposal, so we need to hash it
-                        var possible_output = {j: p.out[j]}
+                        var possible_output = p.out[j]
                         hash = SHA512H(JSON.stringify(possible_output), 'OUTPUT')
                         ram.consensus.possible_output_dict[hash] = possible_output
                     } else {
@@ -732,10 +753,20 @@ function consensus() {
         // { user_pub_key: [ stream of raw input or empty if no input is available ] }
         // every connected user must have an entry
 
+        console.log("final stage inputs:")
+        console.log(JSON.stringify(proposal.inp, null, 2))
+
         console.log("possible input dict")
         console.log(JSON.stringify(ram.consensus.possible_input_dict, null, 2))
 
         var concrete_inputs = {}
+
+        // we need to provide a dummy entry for every connected user
+        // this is so the contract can push data to the user
+        for (var i in proposal.con)
+            concrete_inputs[proposal.con[i]] = []
+
+        // now process any actual inputs
         for (var i in proposal.inp) {
             var hash = proposal.inp[i]
             if (!ram.consensus.possible_input_dict[hash]) {
@@ -755,6 +786,9 @@ function consensus() {
             }
         }
 
+        // clear possible input dictionary since we've materalised the actual inputs
+        ram.consensus.possible_input_dict = {}
+
         console.log('concrete_inputs: ')
         console.log(concrete_inputs)
 
@@ -765,6 +799,9 @@ function consensus() {
         // this will gather outputs into the appropriate place as they become available
         //todo: finish
         run_contract_binary(concrete_inputs)
+
+
+
 
     }
 
@@ -783,34 +820,57 @@ function run_contract_binary(inputs) {
 
     for (var user in inputs) {
         var pipes = pipe.PipeDuplex()
-
+        
         childpipesflat.push(pipes.childread)
         childpipesflat.push(pipes.childwrite)
 
         parentpipesflat.push(pipes.parentread)
         parentpipesflat.push(pipes.parentwrite)
 
-        var parentsockets = pipe.PipeSockets( [ pipes.parentread, pipes.parentwrite ] )
-        outputpipes[user] = parentsockets[0]
+        outputpipes[user] = pipes.parentread
 
         // queue up the input on each of the pipes
-        for (var i in inputs[user])
-            parentsockets[1].write(inputs[user][i])
+        for (var i in inputs[user]) {
+            console.log("writing user input to fd = " + pipes.parentwrite)
+            fs.writeSync(pipes.parentwrite, inputs[user][i])
+        }
 
         // compile a list of pipes and users to provide to the contract as stdin
-        fdlist += user + "=" + pipes.childread + ":" + pipes.childwrite + "\n"
+        fdlist += user + '=' + pipes.childread + ":" + pipes.childwrite + '\n'
 
     }
 
     var bin = [ node.binary ]
     for (var i in node.binargs) bin.push(node.binargs[i])
 
+
     dbg('Contract Execution: ' + bin)
 
     var stdout = pipe.rawforkexecclose(childpipesflat, parentpipesflat, bin, fdlist, node.dir)
+    //var stdout = ""
+
+
+    // collect outptuts
+    // every connection has an entry in the inputs obj even if its []
+    var outputs = {}
+    for (var user in outputpipes) {
+
+        //console.log(Buffer.from(pipe.getfdbytes(outputpipes[user])).toString())
+        var out = Buffer.from(pipe.getfdbytes(outputpipes[user]))
+        if (out.length >0)
+            outputs[user] = sodium.to_hex(out)
+    }
+
+    // close all the pipes we're finished with
+    for (var i in parentpipesflat)
+        fs.closeSync(parentpipesflat[i])
 
     console.log("stdout of contract: \n" + stdout)
 
+    dbg('contract outputs', outputs)
+
+    // these will be proposed in the next novel proposal (stage 0 proposal)
+    ram.consensus.local_output_dict = outputs
 }
 
 
@@ -851,7 +911,11 @@ function init_ram() {
 
     // as above
     ram.consensus.possible_output_dict = {}
-    
+
+    // this stores the result of local execution for proposal in stage 0 
+    ram.consensus.local_output_dict = {}
+   
+     
 
 }
 
