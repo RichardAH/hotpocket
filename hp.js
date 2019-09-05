@@ -190,8 +190,8 @@ function load_contract() {
     node.peers = []
     for (var i in config.peers)
         node.peers.push({
-            ip: config.peers.replace(/:.+$/,''),
-            port: config.peers.replace(/^.*?:/,'')
+            ip: config.peers[i].replace(/:.+$/,''),
+            port: config.peers[i].replace(/^.*?:/,'')
         })
     
     if (node.peers.length == 0)
@@ -286,8 +286,18 @@ function peer_connection_watchdog() {
 
     // finally attempt new connections to anyone left on the list
     for (var i in peer_ips) {
-        var ws = new ws_api('ws://' + i + ':' + peer_ips[i])
-        ws.on('open',((w)=>{return ()=>{on_peer_connection(w)}})(ws))        
+        var ws = false
+        var url = 'ws://' + i + ':' + peer_ips[i]
+        try {
+            ws = new ws_api(url)
+            ws.on('error', e=>{
+                warn('attempted to connect to peer ' + i + ':' + peer_ips[i] + ' but could not connect')
+                warn(e)
+            })
+            ws.on('open',((w)=>{return ()=>{on_peer_connection(w)}})(ws))        
+        } catch (e) {
+            warn('attempted to connect to peer ' + i + ':' + peer_ips[i] + ' but could not connect')
+        }
     }
     
     setTimeout(peer_connection_watchdog, node.roundtime*4)

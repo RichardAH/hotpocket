@@ -12,7 +12,7 @@ sodium.ready.then(main).catch((e)=>{console.log(e)})
     function main() {
 
         var keys = sodium.crypto_sign_keypair()
-            var ws = new ws_api('ws://localhost:8080')
+            var ws = new ws_api((process.argv.length > 2 ? 'ws://localhost:' + process.argv[2] : 'ws://localhost:8080'))
 
             /*
                {
