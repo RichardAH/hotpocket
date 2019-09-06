@@ -570,9 +570,6 @@ function on_peer_connection(ws) {
         }
         // execution to here is a valid peer message
 
-        var msgkeys = Object.keys(msg)
-
-
         // check what sort of message it is
         if (msg.type == 'proposal' && contains_keys(msg, 'con', 'inp', 'out', 'lcl', 'stage', 'timestamp', 'type')) {
             ram.proposals[msghash] = msg
@@ -643,7 +640,65 @@ function on_peer_connection(ws) {
 
         } else if (msg.type == 'hist_resp' && contains_keys(msgkeys, 'hist_resp')) {
 
+            // first check if we actually asked anyone for history!
+            if (!ram.consensus.last_history_request)
+                return warn('peer sent us a history response but we never asked for one!')
+            //todo: consider punishing peer here
+
+            if (!(ram.consensus.last_history_request in msg.hist)) 
+                return warn('peer send us a history response but not containing the lcl we asked for!')
+            //todo: consider punishing peer here
+         
+            // execution to here means we received history containing the lcl we've requested
+
+            // clear the last requested variable
+            var requested_lcl = ram.consensus.last_history_request
+            ram.consensus.last_history_request = false
+
+            // build history map llcl->lcl
+            received_history_map = {}
+            received_history = {} // contains unhexed object of each ledger
+            received_history_raw = {}
+            for (var lcl in msg.hist) {
+                try {
+                    received_history[lcl] = JSON.parse(received_history_raw[lcl] = Buffer.from(msg.hist[lcl], 'hex').toString()) 
+                    received_history_map[lcl] = received_history[lcl].lcl
+                } catch(e) {
+                    return warn('peer send us a history response which we asked for but contained invalid history ... hex or json would not parse')
+                }
+
+            }
+  
+            // invert the map such that llcl -> lcl
+            received_history_map = swap_keys_for_values(received_history_map)
+
+            // start at the first requested ledger and track forward, checking integrity as we go
+            var newest_lcl = ""
+            var upto_lcl = requested_lcl
+            while (upto_lcl in received_history_map) {
+                // check the integrity of the data                
+                var hash = SHA512H(received_history_raw[upto_lcl], 'LEDGER')
+                if (hash != upto_lcl)
+                    return warn('peer sent us a history response we asked for but the ledger data does not match the ledger hashes')
+
+                upto_lcl = received_history_map[upto_lcl]
+                newest_lcl = upto_lcl
+            }
+            // execution to here means the history data sent checks out, so incorporate it
+
+            // first set the last closed legder to the most receive history we received
+            ram.consensus.lcl = upto_lcl
+
+            // now back fill our history cache
+            for (var i in received_history_map) 
+                ram.consensus.ledger_history[i] = received_history[i]
             
+            // finally write files, we do this as two seperate loops because file writing is slow!
+            // and consensus needs to get under way!!
+            for (var i in received_history_map) 
+                fs.writeFileSync(node.dir + '/hist/' + i, received_history_raw[i])
+
+            // done!!!
 
         } else warn('received invalid message from peer') 
 
@@ -733,7 +788,7 @@ function swap_keys_for_values(dict) {
 
 function wait_for_proposals() {
     ram.consensus.stage = 0
-    ram.consensus.nextsleep = node.round.time *= 0.1
+    ram.consensus.nextsleep = node.roundtime *= 0.1
 }
 
 /** 
@@ -1008,7 +1063,10 @@ function consensus() {
                         lcl: proposal.lcl
                     }
                     
+                    ram.consensus.last_history_request = proposal.lcl
+
                     var signed_history_request = sign_peer_message(request).signed
+                    
                     send_to_random_peer(signed_history_request) 
 
                     warn('we are not on the consensus ledger, requesting history from a random peer')
@@ -1241,7 +1299,11 @@ function init_ram() {
     ram.consensus.lcl = 'genesis' 
 
     // we'll keep a log of the last 100 ledger hashes
+    // llcl->lcl
     ram.consensus.ledger_history = {}
+
+    // this variable contains the lcl of the last ledger requested from a peer
+    ram.consensus.last_history_request = false
 
 }
 
