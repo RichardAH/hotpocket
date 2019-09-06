@@ -39,6 +39,15 @@ function warn(message) {
 // helper from https://stackoverflow.com/questions/56134298/is-there-a-way-to-get-all-keys-inside-of-an-object-including-sub-objects
 const get_all_keys = obj => Object.keys(obj).flatMap(k => Object(obj[k]) === obj[k] ? [k, ...get_all_keys(obj[k])] : k).sort()
 
+function key_of_highest_value(obj) {
+    var highestval = Math.max(...Object.values(obj))
+
+    for (var i in obj) 
+        if (obj[i] == highestval) return i
+
+    return null
+}
+
 function process_cmdline(argv) {
 
     var flags = {}
@@ -320,6 +329,7 @@ function open_listen() {
     ram.peer_server.on('close', on_peer_close)
 
     var ws_self = new ws_api('ws://0.0.0.0:'+node.peerport)
+    ws_self._self = true
     ws_self.on('open',((w)=>{return ()=>{on_peer_connection(w)}})(ws_self))        
     
     if (node.pubport) {
@@ -670,6 +680,29 @@ function broadcast_to_peers(message) {
         }
 }
 
+function send_to_random_peer(message) {
+    var peer_keys = Object.keys(ram.peer_connections)
+
+    // we might be the only peer
+    if (peer_keys.length == 1) 
+        return false
+
+    // attempt up to 10 times to randomly find and send to a peer
+    var attempts = 0
+    while(attempts++ < 10) {
+        peer = peer_keys[sodium.randombytes_buf(1)[0] % peer_keys.length]
+        if (ram.peer_connections[peer]._self) continue
+
+        try {
+            ram.peer_connections[peer].send(message)
+        } catch (e) {}
+
+        return true
+    }
+
+    return false
+}
+
 
 
 // helpers
@@ -698,6 +731,11 @@ function swap_keys_for_values(dict) {
     return Object.assign({}, ...Object.entries(dict).map(([a,b]) => ({ [b]: a })))
 }
 
+function wait_for_proposals() {
+    ram.consensus.stage = 0
+    ram.consensus.nextsleep = node.round.time *= 0.1
+}
+
 /** 
     Execute a consensus round 
 **/
@@ -705,17 +743,6 @@ function consensus() {
 
     // wait for entry point into consensus cycles
     var time = (+ new Date())
-
-   /* var votes_ahead_of_us = 0
-    for (var i in ram.proposals) 
-        votes_ahead_of_us += (ram.proposals[i].stage >= ram.consensus.stage ? 1 : 0)
-
-    var wait_for_next_round = (votes_ahead_of_us/ram.proposals.length > 0.2)    
-
-    console.log("votes_ahead_of_us = " + votes_ahead_of_us)
-
-
-*/
 
     var start = time % node.roundtime*4
     if (ram.consensus.stage == 0 && start > 50) {
@@ -753,6 +780,7 @@ function consensus() {
         stage: ram.consensus.stage
     }
 
+
     switch(ram.consensus.stage) {
 
         case 0: // in stage 0 we create a novel proposal and broadcast it
@@ -762,11 +790,12 @@ function consensus() {
             ram.local_pending_inputs = {}
 
 
-            // clear out the old stage 3 proposals
+            // clear out the old stage 3 proposals and any previous proposals made by us
             // todo: check the state of these to ensure we're running consensus ledger
-        
-            for (var p in ram.proposals) if (ram.proposals[p].stage == 3) delete ram.proposals[p] 
-
+            for (var p in ram.proposals) {
+                if (ram.proposals[p].stage == 3 || ram.proposals[p].pubkey == node.pubkeyhex)
+                    delete ram.proposals[p] 
+            }
 
             // change inp and out to objects for stage 0
             // once full versions of inputs and outputs have been circulated
@@ -809,6 +838,8 @@ function consensus() {
             // todo: gather and propose lcl
 
             dbg("novel prop" , proposal)
+
+            broadcast_to_peers(sign_peer_message(proposal).signed)
 
             break
         }
@@ -893,23 +924,16 @@ function consensus() {
 
             }
 
-/*            dbg("votes.stage", votes.stage)
+            // voting is according to specific rules
+            var total_votes = Object.keys(proposals).length
+            var total_possible_votes = node.unl.length
 
-            // count the number of proposals which are behind our proposal stage
-            var nodes_behind_us = 0
-            for (var i = 0; i < ram.consensus.stage - 1; ++i) 
-                if (votes.stage[i] != undefined) nodes_behind_us += votes.stage[i]
-
-            // if more than 20% are behind then skip this propsal and wait
-            if (votes.stage[i] > node.unl.length * 0.2) {
-                // repopulate the proposals we just took 
-                for (var i in proposals) ram.proposals[i] = proposals[i]
-                warn("20%+ of our peers are behind us, skipping a round to let them catch up")
-                ram.consensus.nextsleep = 10
-                return
+            // firstly 80% of our peers must be online and voting before we will progress past stage 0
+            if (total_votes / total_possible_votes < 0.8) {
+                warn('will not proceed until 80% of UNL peers are proposing')
+                return wait_for_proposals() 
             }
-*/
-            
+
 
 
             // threshold the votes and build a new proposal
@@ -945,139 +969,162 @@ function consensus() {
                     largest_count = votes.lcl[i]
                 }
 
+
+
             // todo: the way lcl and state are negotitated using a simple threshold is probably wrong
             // and will potentially lead to forks, should be reconsidered at a later date, e.g. prod
 
+            var peer_msg = sign_peer_message(proposal)
+            var proposal_msg_unsigned = peer_msg.unsigned
+
+            // finally send the proposal to peers
+            broadcast_to_peers(peer_msg.signed) 
+
+
+
+            if (ram.consensus.stage == 3) {
+                // we've reached the end of a consensus round
+
+                // we need to have a look at lcl before we do much else,
+                // if our peers are proposing on a different ledger we need to stop and
+                // request missing history, alternatively if there is no agreement
+                // between peers as to what the last closed ledger was we should collect whatever
+                // history we can and try to figure it out
+
+                // first check if an lcl was NOT established by consensus
+                if (!proposal.lcl) {
+                    // this is a fork condition
+                    die('unable to establish consensus between nodes on what lcl was, fatal! elect a one-time \'canonical\' node with -c <pubkey>')
+                }
+
+
+                // if an lcl was established by consensus now we need to check if we agree with it (are we in the <20%?)
+                // if we don't we need to stop and catch up missing history and state
+                if (ram.consensus.lcl != proposal.lcl) {
+
+                    // create a history request
+                    request = {
+                        type: "hist_req",
+                        lcl: proposal.lcl
+                    }
+                    
+                    var signed_history_request = sign_peer_message(request).signed
+                    send_to_random_peer(signed_history_request) 
+
+                    warn('we are not on the consensus ledger, requesting history from a random peer')
+
+                    return wait_for_proposals()
+
+                    //todo: catch up state
+                }
+
+
+
+                // so we need to apply inputs, collect outputs
+                // and clear buffers, and assign unused inputs to next round
+
+                // here ledger is the encoded string version of the closed ledger,
+                // proposal is the object form
+                var ledger = proposal_msg_unsigned
+
+                // lcl = last closed ledger
+                var lcl = SHA512H( ledger, 'LEDGER' )
             
-    }
-/*
-    // to sign we need to first JSON stringify it in a key sorted fashion
-    var proposal_msg_unsigned = JSON.stringify(proposal, get_all_keys(proposal))
+                console.log("trying to write lcl: " + node.dir + '/hist/' + lcl)
+            
+                fs.writeFileSync( node.dir + '/hist/' + lcl, ledger )
 
-    // create the signature
-    var sig = sodium.to_hex(sodium.crypto_sign_detached(proposal_msg_unsigned, node.seckeybuf))
-    
-    // then add the signature to the message and stringify it again
-    proposal.sig = sig
-    var proposal_msg = JSON.stringify(proposal, get_all_keys(proposal))
-*/
-
-    var peer_msg = sign_peer_message(proposal)
-
-    // todo: clean up these variable names
-    var proposal_msg_unsigned = peer_msg.unsigned
-    var proposal_msg = peer_msg.signed
-
-    // finally send the proposal to peers
-    broadcast_to_peers(proposal_msg) 
-
-    //dbg("sending prop: " + proposal_msg)
+                ram.consensus.lcl = lcl
 
 
-    if (ram.consensus.stage == 3) {
-        // we've reached the end of a consensus round
-        // so we need to apply inputs, collect outputs
-        // and clear buffers, and assign unused inputs to next round
+                // first send out any relevant output from the previous consensus round and execution
+                for (var i in proposal.out) {
+                    var hash = proposal.out[i]
 
-        // here ledger is the encoded string version of the closed ledger,
-        // proposal is the object form
-        var ledger = proposal_msg_unsigned
-
-        // lcl = last closed ledger
-        var lcl = SHA512H( ledger, 'LEDGER' )
-    
-        console.log("trying to write lcl: " + node.dir + '/hist/' + lcl)
-    
-        fs.writeFileSync( node.dir + '/hist/' + lcl, ledger )
-
-        ram.consensus.lcl = lcl
-
-
-        // first send out any relevant output from the previous consensus round and execution
-        for (var i in proposal.out) {
-            var hash = proposal.out[i]
-
-            if (!ram.consensus.possible_output_dict[hash]) {
-                warn('output required ' + hash + ' but wasn\'t in our possible output dict, this will potentially cause desync')
-                continue // todo: consider fatal
-            }
+                    if (!ram.consensus.possible_output_dict[hash]) {
+                        warn('output required ' + hash + ' but wasn\'t in our possible output dict, this will potentially cause desync')
+                        continue // todo: consider fatal
+                    }
 
 
 
-            for (var user in ram.consensus.possible_output_dict[hash]) {
-                // there'll be just the one key
+                    for (var user in ram.consensus.possible_output_dict[hash]) {
+                        // there'll be just the one key
 
-                var output = ram.consensus.possible_output_dict[hash][user]
-                try {
-                    output = Buffer.from(''+output, 'hex').toString()
-                } catch (e) {
-                    warn('output represented by hash ' + hash + ' for user ' + user + ' was not valid hex') 
-                    continue
-                } 
+                        var output = ram.consensus.possible_output_dict[hash][user]
+                        try {
+                            output = Buffer.from(''+output, 'hex').toString()
+                        } catch (e) {
+                            warn('output represented by hash ' + hash + ' for user ' + user + ' was not valid hex') 
+                            continue
+                        } 
 
-                // check if the user is in our locally connected users
-                for (var j in ram.public_connections_authed) {
-                    if (j.replace(/^.*;/, '') == user) {
-                        // this is our locally connected user, send his contract output to him
-                        ram.public_connections_authed[j].send(output)//Uint8Array.from(Buffer.from(output, 'hex')))
+                        // check if the user is in our locally connected users
+                        for (var j in ram.public_connections_authed) {
+                            if (j.replace(/^.*;/, '') == user) {
+                                // this is our locally connected user, send his contract output to him
+                                ram.public_connections_authed[j].send(output)//Uint8Array.from(Buffer.from(output, 'hex')))
+                                break
+                            }
+                        }
+                    }
+                }
+
+                // now we can safely clear our output dictionary
+                ram.consensus.possible_output_dict = {}
+
+
+                // structure we need to provide to the contract binary run routine:
+                // { user_pub_key: [ stream of raw input or empty if no input is available ] }
+                // every connected user must have an entry
+
+                dbg("stage 3 prop", proposal)
+
+                var concrete_inputs = {}
+
+                // we need to provide a dummy entry for every connected user
+                // this is so the contract can push data to the user
+                for (var i in proposal.con)
+                    concrete_inputs[proposal.con[i]] = []
+
+                // now process any actual inputs
+                for (var i in proposal.inp) {
+                    var hash = proposal.inp[i]
+                    if (!ram.consensus.possible_input_dict[hash]) {
+                        warn('input required ' + hash + ' but it wasn\'t in our possible input dict, this will cause desync')
+                        continue //todo: consider making this fatal
+                    }
+
+                    for (var j in ram.consensus.possible_input_dict[hash]) {
+                        // there'll be just the one key
+                        var inputshex = ram.consensus.possible_input_dict[hash][j]
+                        var inputsbuf = []
+                        for (var k in inputshex)
+                            inputsbuf[k] = Buffer.from(inputshex[k], 'hex')
+                        
+                        concrete_inputs[j] = inputsbuf
                         break
                     }
                 }
-            }
+
+                // clear possible input dictionary since we've materalised the actual inputs
+                ram.consensus.possible_input_dict = {}
+
+                //todo: check contract state against consensus
+                //todo: check lcl against consensus
+
+
+                // this will gather outputs into the appropriate place as they become available
+                //todo: finish
+                run_contract_binary(concrete_inputs)
+
+
+
+
         }
-
-        // now we can safely clear our output dictionary
-        ram.consensus.possible_output_dict = {}
-
-
-        // structure we need to provide to the contract binary run routine:
-        // { user_pub_key: [ stream of raw input or empty if no input is available ] }
-        // every connected user must have an entry
-
-        dbg("stage 3 prop", proposal)
-
-        var concrete_inputs = {}
-
-        // we need to provide a dummy entry for every connected user
-        // this is so the contract can push data to the user
-        for (var i in proposal.con)
-            concrete_inputs[proposal.con[i]] = []
-
-        // now process any actual inputs
-        for (var i in proposal.inp) {
-            var hash = proposal.inp[i]
-            if (!ram.consensus.possible_input_dict[hash]) {
-                warn('input required ' + hash + ' but it wasn\'t in our possible input dict, this will cause desync')
-                continue //todo: consider making this fatal
-            }
-
-            for (var j in ram.consensus.possible_input_dict[hash]) {
-                // there'll be just the one key
-                var inputshex = ram.consensus.possible_input_dict[hash][j]
-                var inputsbuf = []
-                for (var k in inputshex)
-                    inputsbuf[k] = Buffer.from(inputshex[k], 'hex')
-                
-                concrete_inputs[j] = inputsbuf
-                break
-            }
-        }
-
-        // clear possible input dictionary since we've materalised the actual inputs
-        ram.consensus.possible_input_dict = {}
-
-        //todo: check contract state against consensus
-        //todo: check lcl against consensus
-
-
-        // this will gather outputs into the appropriate place as they become available
-        //todo: finish
-        run_contract_binary(concrete_inputs)
-
-
-
-
+            
     }
+
 
     ram.consensus.stage = (ram.consensus.stage + 1) % 4  
 }
