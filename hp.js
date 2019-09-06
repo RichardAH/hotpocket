@@ -22,7 +22,7 @@ function SHA512H(m, t) {
     if (t == undefined) t = ''
     if (typeof(m) == 'object') m = JSON.stringify(m)
     m = t + '' + m
-    return crypto.createHash('sha512').update(m).digest('hex').slice(0,16) 
+    return crypto.createHash('sha512').update(m).digest('hex').slice(0,64) 
 }
 
 // print a message to stdout then quit
@@ -59,7 +59,7 @@ function process_cmdline(argv) {
             ""
         )
     
-    node.dir = argv[2]
+    node.dir = argv[2].replace(/\/+$/, '')
     
    
     if (flags.n) create_contract()
@@ -245,8 +245,67 @@ function load_contract() {
     if (config.pubmaxcpm) node.pubmaxcpm = config.pubmaxcpm
     if (config.pubmaxsize) node.pubmaxsize = config.pubmaxsize
 
+    // check history
+    // hist/ directory consists of json files (ledgers) named by their lcl hash
+    // we'll scan the directory for the newest file and load that as the lcl
+
+    var newest_mtime = 0
+    var history_files = fs.readdirSync(node.dir + '/hist')
+
+    // this will map lcl -> llcl, however it will be inverted copied to ram.consensus.ledger_history
+    var history_map = {}
+
+    for (var file in history_files) {
+
+        // check if valid hex
+        if (!history_files[file].match(/^[0-9a-f]{64}/)) {
+            die('found ' + history_files[file] + ' in ' + node.dir + '/hist, however this is not a valid history filename')
+        }
+
+        // check if valid file
+        var stat = {}
+        try {
+            stat = fs.statSync(node.dir + '/hist/' + history_files[file])
+        } catch (e) {
+            die('history file could not be read ' + node.dir + '/hist/' + history_files[file])
+        }
+
+        if (stat.isDirectory()) 
+            die('found directory in ' + node.dir + '/hist, there should be no folders in this directory')
+     
+        // check if valid json 
+        var json = {}
+        var raw = ""
+        try {
+            json = JSON.parse(raw = fs.readFileSync(node.dir + '/hist/' + history_files[file]).toString())
+        } catch (e) {
+            die('could not read or parse ' + node.dir + '/hist/' + history_files[file])    
+        }
+
+        // check if valid hash (expensive)
+        var hash = SHA512H(raw, 'LEDGER')
+        if (hash != history_files[file]) 
+            die('history file ' + node.dir + '/hist/' + history_files[file] + ' content does not match declared hash')
+        
+        // map the lcl -> llcl
+        history_map[history_files[file]] = json.lcl
+        
+        // check if last closed ledger that we have access to
+        if (stat.mtimeMs > newest_mtime) {
+            newest_mtime  = stat.mtimeMs
+            // the last closed ledger will be the newest in the directory
+            // if the network is ahead of us we'll learn about that after 
+            // we begin participating. if there are no valid history files
+            // then the ram initialisation routine has set the first lcl
+            // to "genesis" already and this code will not be executed.
+            ram.consensus.lcl = history_files[file]
+        }
+    }
+
+    // convert to llcl -> lcl
+    ram.consensus.ledger_history = swap_keys_for_values(history_map) 
+
     // todo: check state
-    // todo: check history
 
     // execution to here = all config loaded successfully
 }
@@ -325,11 +384,6 @@ function on_public_close(ws) {
         }
 }
 
-function on_peer_connection(ws) {
-    //todo: filter to by ip ensure peer is on peer list
-    ram.peer_connections[ws._socket.remoteAddress + ":" + ws._socket.remotePort] = ws
-    ws.on('message', on_peer_message)
-}
 
 //todo: handle public disconnection
 
@@ -437,82 +491,172 @@ function prune_cache_watchdog() {
 
 }
 
-function on_peer_message(message) {
 
-    var time = Date.now()
+function on_peer_connection(ws) {
+    //todo: filter to by ip ensure peer is on peer list
+    ram.peer_connections[ws._socket.remoteAddress + ":" + ws._socket.remotePort] = ws
+    ws.on('message', (message)=> {
 
-    // convert the message to json
-    // this is cheap so do this first
-    var msg = {}
-    try {
-        msg = JSON.parse(message)
-    } catch(e) {
-        //todo: disconnect peer for sending bad messages here
-        warn('bad message from peer')
-        return
-    }
-    
-    
-    // check if the peer is on our UNL
-    // this is also pretty cheap so do this second
-    var valid_peer = false
-    if (msg.pubkey)
-    for (var i in node.unl) {
-        if (msg.pubkey == node.unl[i].hex) {
-            valid_peer = true
-            break
+        var time = Date.now()
+
+        // convert the message to json
+        // this is cheap so do this first
+        var msg = {}
+        try {
+            msg = JSON.parse(message)
+        } catch(e) {
+            //todo: disconnect peer for sending bad messages here
+            warn('bad message from peer')
+            return
         }
-    }
-    
-    if (!valid_peer) {
-        warn('received peer message from peer not on our UNL pk = ' + msg.pubkey)
-        //todo: block non-unl peers
-        return
-    }
-   
-    // check timestamp on message 
-    if (msg.timestamp < time/1000.0 - node.roundtime * 4)
-        return warn('received message from peer but it was old')
+        
+        
+        // check if the peer is on our UNL
+        // this is also pretty cheap so do this second
+        var valid_peer = false
+        if (msg.pubkey)
+        for (var i in node.unl) {
+            if (msg.pubkey == node.unl[i].hex) {
+                valid_peer = true
+                break
+            }
+        }
+        
+        if (!valid_peer) {
+            warn('received peer message from peer not on our UNL pk = ' + msg.pubkey)
+            //todo: block non-unl peers
+            return
+        }
+       
+        // check timestamp on message 
+        if (msg.timestamp < time/1000.0 - node.roundtime * 4)
+            return warn('received message from peer but it was old')
 
-    // if the message is valid json and has a pub key we'll hash it and check if we've seen it before
-    // but first we need to prune the signature from it
-    var sig = msg.sig
-    delete msg.sig
-    var msgnosig = JSON.stringify(msg, get_all_keys(msg))
+        // if the message is valid json and has a pub key we'll hash it and check if we've seen it before
+        // but first we need to prune the signature from it
+        var sig = msg.sig
+        delete msg.sig
+        var msgnosig = JSON.stringify(msg, get_all_keys(msg))
 
 
-    // todo: check for further malleability attacks here
-    var msghash = SHA512H(msgnosig, 'PEERMSG')
+        // todo: check for further malleability attacks here
+        var msghash = SHA512H(msgnosig, 'PEERMSG')
 
-    // check if we've seen this message before
-    if (ram.recent_peer_msghash[msghash]) return
+        // check if we've seen this message before
+        if (ram.recent_peer_msghash[msghash]) return
 
-    // place an entry into the cache
-    ram.recent_peer_msghash[msghash] = time
+        // place an entry into the cache
+        ram.recent_peer_msghash[msghash] = time
 
 
-    // check the signature 
-    // this is pretty expensive
-    try {
-        if (!sodium.crypto_sign_verify_detached(Buffer.from(sig, 'hex'), msgnosig, Buffer.from(msg.pubkey, 'hex')))
-            throw null
-    } catch(e) {
-        if (e) warn(e)
-        return warn('received bad signature from peer') // todo: punish peer
-    }
-    // execution to here is a valid peer message
+        // check the signature 
+        // this is pretty expensive
+        try {
+            if (!sodium.crypto_sign_verify_detached(Buffer.from(sig, 'hex'), msgnosig, Buffer.from(msg.pubkey, 'hex')))
+                throw null
+        } catch(e) {
+            if (e) warn(e)
+            return warn('received bad signature from peer') // todo: punish peer
+        }
+        // execution to here is a valid peer message
 
-    var msgkeys = Object.keys(msg)
+        var msgkeys = Object.keys(msg)
 
-    const required_fields = [ 'con', 'inp', 'out', 'lcl', 'stage', 'timestamp', 'type' ]
 
-    // check what sort of message it is
-    if (msg.type == 'proposal' && msgkeys.includes(...required_fields)) {
-        ram.proposals[msghash] = msg
-        // broadcast it to our peers
-        broadcast_to_peers(message)
-    } else warn('received invalid message from peer') 
+        // check what sort of message it is
+        if (msg.type == 'proposal' && contains_keys(msg, 'con', 'inp', 'out', 'lcl', 'stage', 'timestamp', 'type')) {
+            ram.proposals[msghash] = msg
+            // broadcast it to our peers
+            broadcast_to_peers(message)
+        } else if (msg.type == 'hist_req' && contains_keys(msg, 'lcl')) {
+            // a history request message specifies the last closed ledger that the peer knew of
+            // this node will retreive that ledger if it can and all newer ledgers it has and send these
 
+            var response = {
+                type: "hist_resp",
+                hist: {}
+            }
+
+            var requested_lcl = '' + msg.lcl
+            if (!requested_lcl.match(/^[0-9a-f]{64}$/)) {
+                return warn('received history request but lcl was invalid hex')
+                //todo: penalise peer
+            }
+
+            // defensively restrict what the lcl can be even though we checked it above, because it's about
+            // to be fed into the file system
+            
+            if (requested_lcl != 'genesis')
+                requested_lcl = ('' + requested_lcl).replace(/^[^a-f0-9]$/, '')
+
+
+            // history_map maps a last closed ledger to the ledger closed before that one lcl => llcl
+            // however after we build this map we will flip it so llcl->lcl
+            var history_map = {}
+
+            // this will just keep a memory version of the history files we read so we can send them to the recepient
+            var history_raw = {}
+
+            // todo: prune history aggressively to avoid crashing due to memory constraints
+
+            var history_files = fs.readdirSync(node.dir + '/hist')
+            for (var file in history_files) {
+                var json = ""
+                var raw = ""
+                try {
+                    json = JSON.parse(raw = fs.readFileSync( node.dir + '/hist/' + requested_lcl).toString())
+                } catch (e)  {
+                    warn('attempted to read history file ' + history_files[file] + ' but it didn\'t exist or wasn\'t valid JSON')
+                    continue
+                }           
+
+                history_map[history_files[file]] = json.lcl
+                history_raw[history_files[file]] = raw
+            }
+
+            // swap keys with values in the history map
+            history_map = swap_keys_for_values(history_map)
+            
+            // now history_map is llcl -> lcl
+
+            while (history_map[requested_lcl]) {
+                // we found the history they were after, so attach it to the response and then 
+                // check if there's another ledger after the one we found
+                response.hist[requested_lcl] = history_raw[requested_lcl]
+
+                // fetch the next in the sequence
+                requested_lcl = history_map[requested_lcl]
+            } 
+
+            // send any fetched history to the peer
+            return ws.send(sign_peer_message(response).signed)
+
+        } else if (msg.type == 'hist_resp' && contains_keys(msgkeys, 'hist_resp')) {
+
+            
+
+        } else warn('received invalid message from peer') 
+
+    })
+}
+
+function sign_peer_message(message) {
+    // ensure the message contains a timestamp and public key, add one if it doesnt
+    if (!('timestamp' in message)) message.timestamp = Math.floor(Date.now()/1000)
+    if (!('pubkey' in message)) message.pubkey = node.pubkeyhex
+
+
+    // to sign we need to first JSON stringify it in a key sorted fashion
+    var msg_unsigned = JSON.stringify(message, get_all_keys(message))
+
+    // create the signature
+    var sig = sodium.to_hex(sodium.crypto_sign_detached(msg_unsigned, node.seckeybuf))
+
+    // then add the signature to the message and stringify it again
+    message.sig = sig
+    var msg_signed = JSON.stringify(message, get_all_keys(message))
+
+    return  { signed: msg_signed, unsigned: msg_unsigned }
 }
 
 
@@ -527,6 +671,9 @@ function broadcast_to_peers(message) {
 }
 
 
+
+// helpers
+
 function dbg(m, o) {
     if (typeof(o) != 'undefined') {
         console.log('DBG: ' + m)
@@ -539,6 +686,18 @@ function dbg(m, o) {
 // helper function for voting
 function inc(x, y) { if (x[y] == undefined) return x[y] = 1; return x[y]++; }
 
+function  contains_keys (obj, ...key_set) {
+	for (var x in key_set) 
+		if (!(key_set[x] in obj)) return false	
+	return true
+}
+
+// key swap code from https://stackoverflow.com/a/46582758
+// swap the keys and values in an object
+function swap_keys_for_values(dict) {
+    return Object.assign({}, ...Object.entries(dict).map(([a,b]) => ({ [b]: a })))
+}
+
 /** 
     Execute a consensus round 
 **/
@@ -546,16 +705,28 @@ function consensus() {
 
     // wait for entry point into consensus cycles
     var time = (+ new Date())
+
+   /* var votes_ahead_of_us = 0
+    for (var i in ram.proposals) 
+        votes_ahead_of_us += (ram.proposals[i].stage >= ram.consensus.stage ? 1 : 0)
+
+    var wait_for_next_round = (votes_ahead_of_us/ram.proposals.length > 0.2)    
+
+    console.log("votes_ahead_of_us = " + votes_ahead_of_us)
+
+
+*/
+
     var start = time % node.roundtime*4
     if (ram.consensus.stage == 0 && start > 50) {
-        ram.consensus.nextsleep = 1
-        //dbg('sleeping... waiting to join consensus ' + start + ' | ' + time + ' | ' + ram.consensus.nextsleep) 
+    //if (wait_for_next_round) {
+        ram.consensus.nextsleep = 10
         return
     }
+    //ram.consensus.nextsleep = node.roundtime 
+    //dbg('ready ' + time + " nextsleep = " + ram.consensus.nextsleep)
 
 
-    ram.consensus.nextsleep = node.roundtime - 200
-    dbg('ready ' + time + " nextsleep = " + ram.consensus.nextsleep)
 
     /**
         A proposal is a json object consisting of 5 sections
@@ -578,7 +749,7 @@ function consensus() {
         inp: [],
         out: [],
         sta: "",
-        lcl: "",
+        lcl: ram.consensus.lcl,
         stage: ram.consensus.stage
     }
 
@@ -587,8 +758,6 @@ function consensus() {
         case 0: // in stage 0 we create a novel proposal and broadcast it
         {
             
-            console.log("ram.local_pending_inputs = ")
-            console.log(JSON.stringify(ram.local_pending_inputs, null, 2))
             var pending_inputs = ram.local_pending_inputs
             ram.local_pending_inputs = {}
 
@@ -608,6 +777,7 @@ function consensus() {
             // inp = [ hash_of_user_1_inputs, hash_of_user_2_inputs, .. ]
             proposal.inp = {}
             proposal.out = {}
+
 
             for (var i in ram.public_connections_authed) {
                 // add all the connections we host (mentioned by their public key only)
@@ -638,6 +808,8 @@ function consensus() {
             // todo: gather and propose state
             // todo: gather and propose lcl
 
+            dbg("novel prop" , proposal)
+
             break
         }
 
@@ -648,28 +820,35 @@ function consensus() {
             var proposals = ram.proposals
             
             
-            dbg("proposals", proposals)
+            //dbg("proposals", proposals)
+            console.log("proposal count", Object.keys(proposals).length)
+
 
             ram.proposals = {}
 
             
-            //todo: tally all the connections, inputs, outputs, state, lcl, from all proposals
-            // and then propose a new proposal based on those tallies
-
             var votes = {
                 con: {},
                 inp: {},
                 out: {},
                 sta: {},
-                lcl: {}
+                lcl: {},
+                stage: {} // this will let us know if we're participating properly in consensus
             }
 
             for (var i in proposals) {
                 var p = proposals[i]
 
+                // don't consider old proposals
+                if (time - p.timestamp > node.roundtime * 2) {
+                    continue
+                }
+            
                 inc(votes.sta, p.sta)
     
                 inc(votes.lcl, p.lcl)
+
+                inc(votes.stage, p.stage)
 
                 for (var j in p.con)
                     inc(votes.con, p.con[j])
@@ -712,8 +891,25 @@ function consensus() {
                     inc(votes.out, hash)
                 }
 
-                delete proposal[i]
             }
+
+/*            dbg("votes.stage", votes.stage)
+
+            // count the number of proposals which are behind our proposal stage
+            var nodes_behind_us = 0
+            for (var i = 0; i < ram.consensus.stage - 1; ++i) 
+                if (votes.stage[i] != undefined) nodes_behind_us += votes.stage[i]
+
+            // if more than 20% are behind then skip this propsal and wait
+            if (votes.stage[i] > node.unl.length * 0.2) {
+                // repopulate the proposals we just took 
+                for (var i in proposals) ram.proposals[i] = proposals[i]
+                warn("20%+ of our peers are behind us, skipping a round to let them catch up")
+                ram.consensus.nextsleep = 10
+                return
+            }
+*/
+            
 
 
             // threshold the votes and build a new proposal
@@ -754,10 +950,7 @@ function consensus() {
 
             
     }
-
-
-
-
+/*
     // to sign we need to first JSON stringify it in a key sorted fashion
     var proposal_msg_unsigned = JSON.stringify(proposal, get_all_keys(proposal))
 
@@ -767,6 +960,13 @@ function consensus() {
     // then add the signature to the message and stringify it again
     proposal.sig = sig
     var proposal_msg = JSON.stringify(proposal, get_all_keys(proposal))
+*/
+
+    var peer_msg = sign_peer_message(proposal)
+
+    // todo: clean up these variable names
+    var proposal_msg_unsigned = peer_msg.unsigned
+    var proposal_msg = peer_msg.signed
 
     // finally send the proposal to peers
     broadcast_to_peers(proposal_msg) 
@@ -779,9 +979,19 @@ function consensus() {
         // so we need to apply inputs, collect outputs
         // and clear buffers, and assign unused inputs to next round
 
-        dbg("proposal.out", proposal.out)
+        // here ledger is the encoded string version of the closed ledger,
+        // proposal is the object form
+        var ledger = proposal_msg_unsigned
 
-        dbg('ram.consensus.possible_output_dict',  ram.consensus.possible_output_dict[hash])
+        // lcl = last closed ledger
+        var lcl = SHA512H( ledger, 'LEDGER' )
+    
+        console.log("trying to write lcl: " + node.dir + '/hist/' + lcl)
+    
+        fs.writeFileSync( node.dir + '/hist/' + lcl, ledger )
+
+        ram.consensus.lcl = lcl
+
 
         // first send out any relevant output from the previous consensus round and execution
         for (var i in proposal.out) {
@@ -805,8 +1015,6 @@ function consensus() {
                     continue
                 } 
 
-                dbg("found output", output)
-                
                 // check if the user is in our locally connected users
                 for (var j in ram.public_connections_authed) {
                     if (j.replace(/^.*;/, '') == user) {
@@ -826,6 +1034,7 @@ function consensus() {
         // { user_pub_key: [ stream of raw input or empty if no input is available ] }
         // every connected user must have an entry
 
+        dbg("stage 3 prop", proposal)
 
         var concrete_inputs = {}
 
@@ -857,9 +1066,6 @@ function consensus() {
         // clear possible input dictionary since we've materalised the actual inputs
         ram.consensus.possible_input_dict = {}
 
-        console.log('concrete_inputs: ')
-        console.log(concrete_inputs)
-
         //todo: check contract state against consensus
         //todo: check lcl against consensus
 
@@ -886,6 +1092,7 @@ function run_contract_binary(inputs) {
 
     var fdlist = "HOTPOCKET " + HP_VERSION + "\n"
 
+
     for (var user in inputs) {
         var pipes = pipe.PipeDuplex()
         
@@ -908,15 +1115,17 @@ function run_contract_binary(inputs) {
 
     }
 
+    console.log(fdlist)
+
     var bin = [ node.binary ]
     for (var i in node.binargs) bin.push(node.binargs[i])
 
 
-    dbg('Contract Execution: ' + bin)
+    //dbg('Contract Execution: ' + bin)
 
     var stdout = pipe.rawforkexecclose(childpipesflat, parentpipesflat, bin, fdlist, node.dir)
     //var stdout = ""
-
+    console.log(stdout)
 
     // collect outptuts
     // every connection has an entry in the inputs obj even if its []
@@ -934,8 +1143,6 @@ function run_contract_binary(inputs) {
         fs.closeSync(parentpipesflat[i])
 
     console.log("stdout of contract: \n" + stdout)
-
-    dbg('contract outputs', outputs)
 
     // these will be proposed in the next novel proposal (stage 0 proposal)
     ram.consensus.local_output_dict = outputs
@@ -982,8 +1189,12 @@ function init_ram() {
 
     // this stores the result of local execution for proposal in stage 0 
     ram.consensus.local_output_dict = {}
-   
-     
+  
+    // set lcl to genesis, this will be override by load_contract usually
+    ram.consensus.lcl = 'genesis' 
+
+    // we'll keep a log of the last 100 ledger hashes
+    ram.consensus.ledger_history = {}
 
 }
 
@@ -992,13 +1203,13 @@ function main() {
 
     // process cmdline if present
     process_cmdline(process.argv)
+    
+    // set up working structures
+    init_ram()
 
     // load config
     load_contract()
   
-    // set up working structures
-    init_ram()
- 
     // start listening for peers
     open_listen()
  
