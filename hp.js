@@ -1044,7 +1044,6 @@ function consensus() {
                     if (typeof(p.out[j]) == "object") {
                         // this is a full output proposal, so we need to hash it
 
-                        dbg("p.out[j] = ", p.out[j])
                         var possible_output = {}
                         possible_output[j] = p.out[j]
                         hash = SHA512H(JSON.stringify(possible_output), 'OUTPUT')
@@ -1146,8 +1145,8 @@ function consensus() {
                 // lcl = last closed ledger
                 var lcl = SHA512H( ledger, 'LEDGER' )
             
-                console.log("trying to write lcl: " + node.dir + '/hist/' + lcl)
-
+                //console.log("trying to write lcl: " + node.dir + '/hist/' + lcl)
+                dbg('last closed ledger: ' + lcl)
             
                 //fs.writeFileSync( node.dir + '/hist/' + lcl, ledger )
 
@@ -1271,17 +1270,16 @@ function run_contract_binary(inputs) {
 
         // queue up the input on each of the pipes
         for (var i in inputs[user]) {
-            console.log("writing user input to fd = " + pipes.parentwrite)
+            dbg("writing " + inputs[user][i].length  + " bytes of user input to fd = " + pipes.parentwrite)
             fs.writeSync(pipes.parentwrite, inputs[user][i])
         }
 
         // compile a list of pipes and users to provide to the contract as stdin
         fdlist += user + '=' + pipes.childread + ":" + pipes.childwrite + '\n'
 
-        dbg('pipes', pipes)
     }
 
-    console.log(fdlist)
+    //console.log(fdlist)
 
     var bin = [ node.binary ]
     for (var i in node.binargs) bin.push(node.binargs[i])
@@ -1291,7 +1289,7 @@ function run_contract_binary(inputs) {
 
     var stdout = pipe.rawforkexecclose(childpipesflat, parentpipesflat, bin, fdlist, node.dir)
     //var stdout = ""
-    console.log(stdout)
+    //console.log(stdout)
 
     // collect outptuts
     // every connection has an entry in the inputs obj even if its []
@@ -1300,22 +1298,23 @@ function run_contract_binary(inputs) {
 
         //console.log(Buffer.from(pipe.getfdbytes(outputpipes[user])).toString())
         var out = Buffer.from(pipe.getfdbytes(outputpipes[user]))
-        if (out.length >0)
+        if (out.length > 0) {
             outputs[user] =  [sodium.to_hex(out)]
+            dbg("contract produced " + out.length + " bytes of output on fd " + outputpipes[user])
+        }
     }
 
     // close all the pipes we're finished with
-    for (var i in parentpipesflat) {
-        console.log("closing " + parentpipesflat[i])
+    for (var i in parentpipesflat) 
         fs.closeSync(parentpipesflat[i])
-    }
+    
 
     // attempt to close child pipes too
     for (var i in childpipesflat)
         try {
-        fs.closeSync(childpipesflat[i])
+         fs.closeSync(childpipesflat[i])
         } catch(e) {}
-    console.log("stdout of contract: \n" + stdout)
+    //console.log("stdout of contract: \n" + stdout)
 
     // these will be proposed in the next novel proposal (stage 0 proposal)
     ram.consensus.local_output_dict = outputs
