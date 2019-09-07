@@ -572,7 +572,8 @@ function on_peer_connection(ws) {
 
         // check what sort of message it is
         if (msg.type == 'proposal' && contains_keys(msg, 'con', 'inp', 'out', 'lcl', 'stage', 'timestamp', 'type')) {
-            ram.proposals[msghash] = msg
+            console.log('received proposal')
+            ram.consensus.proposals[msghash] = msg
             // broadcast it to our peers
             broadcast_to_peers(message)
         } else if (msg.type == 'hist_req' && contains_keys(msg, 'lcl')) {
@@ -638,7 +639,7 @@ function on_peer_connection(ws) {
             // send any fetched history to the peer
             return ws.send(sign_peer_message(response).signed)
 
-        } else if (msg.type == 'hist_resp' && contains_keys(msgkeys, 'hist_resp')) {
+        } else if (msg.type == 'hist_resp' && contains_keys(msg, 'hist_resp')) {
 
             // first check if we actually asked anyone for history!
             if (!ram.consensus.last_history_request)
@@ -786,11 +787,66 @@ function swap_keys_for_values(dict) {
     return Object.assign({}, ...Object.entries(dict).map(([a,b]) => ({ [b]: a })))
 }
 
-function wait_for_proposals() {
-    ram.consensus.stage = 0
-    ram.consensus.nextsleep = node.roundtime *= 0.1
+function wait_for_proposals(reset) {
+    if (reset) ram.consensus.stage = 0
+    ram.consensus.nextsleep = (sodium.randombytes_buf(1)[0]/256) * node.roundtime 
 }
 
+/**
+    Check our LCL is consistent with the proposals being made by our UNL peers
+    lcl_votes -- dictionary mapping lcl -> number of peers who proposed for that lcl
+    return value: true if proposing should stop for history catch up, 
+                  false if proposing should continue
+**/
+function check_lcl_votes(lcl_votes) {
+
+    var total_votes = 0 
+    for (var i in lcl_votes)
+            total_votes += lcl_votes[i]
+    
+    if (total_votes == 0)
+        return true 
+
+    if (total_votes < node.unl.length * 0.8) {
+            warn('not enough peers proposing to perform consensus (' + total_votes + ' out of ' + node.unl.length + 
+                 ', need ' + Math.ceil(node.unl.length*0.8) + ')')
+            return false
+    }
+
+    var winning_lcl = key_of_highest_value(lcl_votes)
+
+    var winning_votes = lcl_votes[winning_lcl]
+
+    if ( winning_votes / total_votes < 0.8) 
+    {
+        // fork condition
+        die('no consensus on lcl, fatal. votes were: ' + JSON.stringify(lcl_votes)) 
+    }
+
+    // execution to here means the winning_lcl has 80%+ support
+
+    if (ram.consensus.lcl != proposal.lcl) {
+
+        // create a history request
+        request = {
+            type: "hist_req",
+            lcl: winning_lcl
+        }
+        
+        ram.consensus.last_history_request = winning_lcl
+
+        var signed_history_request = sign_peer_message(request).signed
+        
+        send_to_random_peer(signed_history_request) 
+
+        warn('we are not on the consensus ledger, requesting history from a random peer')
+
+        return true
+        //todo: catch up state
+    }
+
+    return false
+}
 /** 
     Execute a consensus round 
 **/
@@ -798,16 +854,6 @@ function consensus() {
 
     // wait for entry point into consensus cycles
     var time = (+ new Date())
-
-    var start = time % node.roundtime*4
-    if (ram.consensus.stage == 0 && start > 50) {
-    //if (wait_for_next_round) {
-        ram.consensus.nextsleep = 10
-        return
-    }
-    //ram.consensus.nextsleep = node.roundtime 
-    //dbg('ready ' + time + " nextsleep = " + ram.consensus.nextsleep)
-
 
 
     /**
@@ -847,9 +893,9 @@ function consensus() {
 
             // clear out the old stage 3 proposals and any previous proposals made by us
             // todo: check the state of these to ensure we're running consensus ledger
-            for (var p in ram.proposals) {
-                if (ram.proposals[p].stage == 3 || ram.proposals[p].pubkey == node.pubkeyhex)
-                    delete ram.proposals[p] 
+            for (var p in ram.consensus.proposals) {
+                if (ram.consensus.proposals[p].stage == 3 || ram.consensus.proposals[p].pubkey == node.pubkeyhex)
+                    delete ram.consensus.proposals[p] 
             }
 
             // change inp and out to objects for stage 0
@@ -903,14 +949,10 @@ function consensus() {
         case 2:
         case 3:
     
-            var proposals = ram.proposals
+            var proposals = ram.consensus.proposals
             
-            
-            //dbg("proposals", proposals)
-            console.log("proposal count", Object.keys(proposals).length)
 
-
-            ram.proposals = {}
+            ram.consensus.proposals = {}
 
             
             var votes = {
@@ -922,18 +964,36 @@ function consensus() {
                 stage: {} // this will let us know if we're participating properly in consensus
             }
 
+            // we need to consider what our peers believe the LCL is first before we can participate in voting
+            // if our peers have different ideas of what the LCL is we might be in a fork condition
+            // and need to halt, alternatively if > 80% agree on an LCL different to ours we need to request
+            // history first and are not currently ready to vote
+
+            lcl_votes = {}
+            for (var i in proposals)
+                if (time - proposals[i].timestamp < node.roundtime * 4 && 
+                    proposals[i].stage == ram.consensus.stage - 1) {
+                    inc(lcl_votes, proposals[i].lcl)
+                } else if (proposals[i].stage < ram.consensus.stage - 1) {
+                    console.log("deleting old proposals " + proposals[i].lcl + ".stage=" + 
+                                proposals[i].stage + " from " + proposals[i].pubkey)
+                    delete proposals[i]
+                }
+
+            if (check_lcl_votes(lcl_votes))
+                return wait_for_proposals(true)
+
+            // execution to here means we are on the consensus ledger
+
             for (var i in proposals) {
                 var p = proposals[i]
 
-                // don't consider old proposals
-                if (time - p.timestamp > node.roundtime * 2) {
-                    continue
-                }
+                dbg('proposal ' + i, proposals[i])
             
                 inc(votes.sta, p.sta)
-    
+   
+                // todo: no real need for either of these, consider removing
                 inc(votes.lcl, p.lcl)
-
                 inc(votes.stage, p.stage)
 
                 for (var j in p.con)
@@ -983,10 +1043,13 @@ function consensus() {
             var total_votes = Object.keys(proposals).length
             var total_possible_votes = node.unl.length
 
-            // firstly 80% of our peers must be online and voting before we will progress past stage 0
+            // firstly 80% of our peers must be online and voting before we will progress 
             if (total_votes / total_possible_votes < 0.8) {
-                warn('will not proceed until 80% of UNL peers are proposing')
-                return wait_for_proposals() 
+                warn('will not proceed until 80% of UNL peers are proposing -- have ' + total_votes + ' out of ' + total_possible_votes)
+                // copy proposals back into ram
+                for (var i in proposals)
+                    ram.consensus.proposals[i] = proposals[i] 
+                return wait_for_proposals(false) 
             }
 
 
@@ -1040,50 +1103,19 @@ function consensus() {
             if (ram.consensus.stage == 3) {
                 // we've reached the end of a consensus round
 
-                // we need to have a look at lcl before we do much else,
-                // if our peers are proposing on a different ledger we need to stop and
-                // request missing history, alternatively if there is no agreement
-                // between peers as to what the last closed ledger was we should collect whatever
-                // history we can and try to figure it out
-
-                // first check if an lcl was NOT established by consensus
-                if (!proposal.lcl) {
-                    // this is a fork condition
-                    die('unable to establish consensus between nodes on what lcl was, fatal! elect a one-time \'canonical\' node with -c <pubkey>')
-                }
-
-
-                // if an lcl was established by consensus now we need to check if we agree with it (are we in the <20%?)
-                // if we don't we need to stop and catch up missing history and state
-                if (ram.consensus.lcl != proposal.lcl) {
-
-                    // create a history request
-                    request = {
-                        type: "hist_req",
-                        lcl: proposal.lcl
-                    }
-                    
-                    ram.consensus.last_history_request = proposal.lcl
-
-                    var signed_history_request = sign_peer_message(request).signed
-                    
-                    send_to_random_peer(signed_history_request) 
-
-                    warn('we are not on the consensus ledger, requesting history from a random peer')
-
-                    return wait_for_proposals()
-
-                    //todo: catch up state
-                }
-
-
-
                 // so we need to apply inputs, collect outputs
                 // and clear buffers, and assign unused inputs to next round
 
                 // here ledger is the encoded string version of the closed ledger,
                 // proposal is the object form
-                var ledger = proposal_msg_unsigned
+                
+
+                // prune off timestamp, pubkey, signature
+                delete proposal.pubkey
+                delete proposal.timestamp
+                delete proposal.sig
+
+                var ledger = JSON.stringify(proposal, get_all_keys(proposal))
 
                 // lcl = last closed ledger
                 var lcl = SHA512H( ledger, 'LEDGER' )
@@ -1258,7 +1290,6 @@ function init_ram() {
 
 
 
-    ram.proposals = {}
 
     // IP:PORT -> ws for all peers
     ram.peer_connections = {}
@@ -1284,6 +1315,9 @@ function init_ram() {
     // ram.consensus contains all transient state information about consensus 
     ram.consensus = {}
 
+    // this stores incoming proposals
+    ram.consensus.proposals = {}
+    
     // this is a dictionary mapping hashes of inputs to actual inputs
     // in the first stage of proposal full inputs are gossiped
     // in subsequent stages of proposal only the hash is gossiped
