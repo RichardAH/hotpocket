@@ -24,6 +24,10 @@ check_available 'gcc'
 check_available 'node'
 check_available 'awk'
 check_available 'tail'
+check_available 'npm'
+
+echo 'ensuring node modules are installed'
+npm install
 
 # execution to here means gcc and other tools are present
 echo 'building contract binaries...'
