@@ -1,0 +1,42 @@
+#!/bin/bash
+
+function check_available() {
+    which $1 > /dev/null 2>&1
+    if [ "$?" -gt "0" ]; then
+        echo "$1 not found... required for building contract binary. please install $1 first"
+        exit
+    fi
+}
+
+function check_exists() {
+    stat $1 > /dev/null 2>&1
+    if [ "$?" -gt "0" ]; then
+        echo "$1 not found at `pwd`"
+        exit
+    fi
+}
+
+check_exists 'test-contract-node-a'
+check_exists 'test-contract-node-b'
+check_exists 'hp.js'
+check_exists 'hp_client.js'
+check_available 'gcc'
+check_available 'node'
+check_available 'awk'
+check_available 'tail'
+
+# execution to here means gcc and other tools are present
+echo 'building contract binaries...'
+gcc test-contract-node-a/bin/contract.c -o test-contract-node-a/bin/contract
+gcc test-contract-node-b/bin/contract.c -o test-contract-node-b/bin/contract
+
+echo 'starting nodes'
+node hp.js test-contract-node-a > node-a-output 2>&1 &
+node hp.js test-contract-node-b > node-b-output 2>&1 &
+
+echo 'following output of nodes'
+tail -f node-a-output | awk '{print("NODE_A: " $0);}' &
+tail -f node-b-output | awk '{print("NODE_B: " $0);}' &
+
+echo 'starting client'
+node hp_client.js
