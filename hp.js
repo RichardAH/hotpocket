@@ -324,15 +324,19 @@ function load_contract() {
     NB: TLS implementation needed
 **/
 function open_listen() {
+    
+    console.log("NEW SOCKET ###########2")
     ram.peer_server = new ws_api.Server({ port: node.peerport });
     ram.peer_server.on('connection', on_peer_connection)
     ram.peer_server.on('close', on_peer_close)
 
+    console.log("NEW SOCKET ###########3")
     var ws_self = new ws_api('ws://0.0.0.0:'+node.peerport)
     ws_self._self = true
     ws_self.on('open',((w)=>{return ()=>{on_peer_connection(w)}})(ws_self))        
     
     if (node.pubport) {
+        console.log("NEW SOCKET ###########4")
         ram.public_server = new ws_api.Server({ port: node.pubport });
         ram.public_server.on('connection', on_public_connection)
         ram.public_server.on('close', on_public_close)
@@ -342,25 +346,32 @@ function open_listen() {
 
 // scans peers continuously attempting to maintain peer connections if they drop
 function peer_connection_watchdog() {
+    
     // create a list of IPs we should have active connections with
     var peer_ips = {}
-    for (var i in node.peers)
-        peer_ips[node.peers[i].ip] = node.peers[i].port
-
+    for (var i in node.peers) {
+        var ip = node.peers[i].ip 
+        var port = node.peers[i].port
+        if (ip == '0.0.0.0') ip = '127.0.0.1'
+        peer_ips[ip + ":" + port] = true
+    }
     // delete from that list every IP we do already have an active connection with
     for (var i in ram.peer_connections) {
-        var ip = i.replace(/:.+$/,'')
-        if (peer_ips[ip]) delete peer_ips[ip]
-    } 
+        if (peer_ips[i]) delete peer_ips[i]
+    }
+
+    dbg('peer connections', Object.keys(ram.peer_connections))
+    dbg('peer connections to retry', Object.keys(peer_ips))
 
     // finally attempt new connections to anyone left on the list
     for (var i in peer_ips) {
         var ws = false
-        var url = 'ws://' + i + ':' + peer_ips[i]
+        var url = 'ws://' + i 
         try {
+            console.log("NEW SOCKET ###########1")
             ws = new ws_api(url)
             ws.on('error', e=>{
-                warn('attempted to connect to peer ' + i + ':' + peer_ips[i] + ' but could not connect')
+                warn('attempted to connect to peer ' + i + ' but could not connect')
                 warn(e)
             })
             ws.on('open',((w)=>{return ()=>{on_peer_connection(w)}})(ws))        
@@ -400,6 +411,8 @@ function on_public_close(ws) {
 
 function on_public_connection(ws) {
 
+    console.log('public connected !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+
     if (!node.pubport) die('received a public connection even though public port was not specified')
     //todo: filter by abuse/ip here to stop ddos
     ram.public_connections_unauthed[ws._socket.remoteAddress + ":" + ws._socket.remotePort] = ws
@@ -413,13 +426,20 @@ function on_public_connection(ws) {
 
     ws.on('close', () => {
 
-        if (ws._authed) {
+        console.log("public disconnected @@@@@@@@@@@@@")
+
+        if (ram.public_connections_authed[ws._authed]) {
+            console.log('removing from authed')
             delete ram.public_connections_authed[ws._authed]
-            return
         }
 
-        delete ram.public_connections_unauthed[ws._socket.remoteAddress + ":" + ws._socket.remotePort]
 
+        if (ram.public_connections_unauthed[ws._socket.remoteAddress + ":" + ws._socket.remotePort])
+        {
+            console.log('removing from unauthed')
+            delete ram.public_connections_unauthed[ws._socket.remoteAddress + ":" + ws._socket.remotePort]
+            
+        }
     })
  
     ws.on('message', (message) => {
@@ -504,6 +524,7 @@ function prune_cache_watchdog() {
 
 function on_peer_connection(ws) {
     //todo: filter to by ip ensure peer is on peer list
+    console.log('peer connected *****************************************')
     ram.peer_connections[ws._socket.remoteAddress + ":" + ws._socket.remotePort] = ws
     ws.on('message', (message)=> {
 
@@ -572,7 +593,6 @@ function on_peer_connection(ws) {
 
         // check what sort of message it is
         if (msg.type == 'proposal' && contains_keys(msg, 'con', 'inp', 'out', 'lcl', 'stage', 'timestamp', 'type')) {
-            console.log('received proposal')
             ram.consensus.proposals[msghash] = msg
             // broadcast it to our peers
             broadcast_to_peers(message)
@@ -948,9 +968,6 @@ function consensus() {
             
 
             // todo: gather and propose state
-            // todo: gather and propose lcl
-
-            dbg("novel prop" , proposal)
 
             broadcast_to_peers(sign_peer_message(proposal).signed)
 
@@ -1134,8 +1151,13 @@ function consensus() {
                 var lcl = SHA512H( ledger, 'LEDGER' )
             
                 console.log("trying to write lcl: " + node.dir + '/hist/' + lcl)
+
             
-                fs.writeFileSync( node.dir + '/hist/' + lcl, ledger )
+                //fs.writeFileSync( node.dir + '/hist/' + lcl, ledger )
+
+                var fd = fs.openSync( node.dir + '/hist/' + lcl, 'w' )
+                fs.writeSync(fd, ledger)
+                fs.closeSync(fd)
 
                 ram.consensus.lcl = lcl
 
@@ -1181,7 +1203,7 @@ function consensus() {
                 // { user_pub_key: [ stream of raw input or empty if no input is available ] }
                 // every connected user must have an entry
 
-                dbg("stage 3 prop", proposal)
+                //dbg("closed ledger", proposal)
 
                 var concrete_inputs = {}
 
@@ -1214,15 +1236,8 @@ function consensus() {
                 ram.consensus.possible_input_dict = {}
 
                 //todo: check contract state against consensus
-                //todo: check lcl against consensus
 
-
-                // this will gather outputs into the appropriate place as they become available
-                //todo: finish
                 run_contract_binary(concrete_inputs)
-
-
-
 
         }
             
@@ -1293,9 +1308,16 @@ function run_contract_binary(inputs) {
     }
 
     // close all the pipes we're finished with
-    for (var i in parentpipesflat)
+    for (var i in parentpipesflat) {
+        console.log("closing " + parentpipesflat[i])
         fs.closeSync(parentpipesflat[i])
+    }
 
+    // attempt to close child pipes too
+    for (var i in childpipesflat)
+        try {
+        fs.closeSync(childpipesflat[i])
+        } catch(e) {}
     console.log("stdout of contract: \n" + stdout)
 
     // these will be proposed in the next novel proposal (stage 0 proposal)
