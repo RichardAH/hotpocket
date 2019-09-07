@@ -789,7 +789,7 @@ function swap_keys_for_values(dict) {
 
 function wait_for_proposals(reset) {
     if (reset) ram.consensus.stage = 0
-    ram.consensus.nextsleep = (sodium.randombytes_buf(1)[0]/256) * node.roundtime 
+    ram.consensus.nextsleep = 1// (sodium.randombytes_buf(1)[0]/256)*1000// * node.roundtime 
 }
 
 /**
@@ -798,6 +798,7 @@ function wait_for_proposals(reset) {
     return value: true if proposing should stop for history catch up, 
                   false if proposing should continue
 **/
+
 function check_lcl_votes(lcl_votes) {
 
     var total_votes = 0 
@@ -808,8 +809,13 @@ function check_lcl_votes(lcl_votes) {
         return true 
 
     if (total_votes < node.unl.length * 0.8) {
-            warn('not enough peers proposing to perform consensus (' + total_votes + ' out of ' + node.unl.length + 
-                 ', need ' + Math.ceil(node.unl.length*0.8) + ')')
+            var time = Math.floor(Date.now()/1000)
+            if (ram.consensus.last_not_enough_peer_msg && 
+                time - ram.consensus.last_not_enough_peer_msg > 10) {
+                ram.consensus.last_not_enough_peer_msg = Date.now()
+                warn('not enough peers proposing to perform consensus (' + total_votes + ' out of ' + node.unl.length + 
+                     ', need ' + Math.ceil(node.unl.length*0.8) + ')')
+            }
             return false
     }
 
@@ -988,7 +994,7 @@ function consensus() {
             for (var i in proposals) {
                 var p = proposals[i]
 
-                dbg('proposal ' + i, proposals[i])
+                //dbg('proposal ' + i, proposals[i])
             
                 inc(votes.sta, p.sta)
    
@@ -1045,7 +1051,7 @@ function consensus() {
 
             // firstly 80% of our peers must be online and voting before we will progress 
             if (total_votes / total_possible_votes < 0.8) {
-                warn('will not proceed until 80% of UNL peers are proposing -- have ' + total_votes + ' out of ' + total_possible_votes)
+                //warn('will not proceed until 80% of UNL peers are proposing -- have ' + total_votes + ' out of ' + total_possible_votes)
                 // copy proposals back into ram
                 for (var i in proposals)
                     ram.consensus.proposals[i] = proposals[i] 
@@ -1215,6 +1221,10 @@ function consensus() {
             
     }
 
+    // after a novel proposal we will just busy wait for proposals
+    if (ram.consensus.stage > 0)
+        ram.consensus.nextsleep = Math.floor(node.roundtime/4)
+    else ram.consensus.nextsleep = 1
 
     ram.consensus.stage = (ram.consensus.stage + 1) % 4  
 }
