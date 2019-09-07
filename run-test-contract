@@ -26,6 +26,12 @@ check_available 'awk'
 check_available 'tail'
 check_available 'npm'
 
+mkdir test-contract-node-a/state
+mkdir test-contract-node-a/hist
+
+mkdir test-contract-node-b/state
+mkdir test-contract-node-b/hist
+
 echo 'ensuring node modules are installed'
 npm install
 
