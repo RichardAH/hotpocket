@@ -325,18 +325,15 @@ function load_contract() {
 **/
 function open_listen() {
     
-    console.log("NEW SOCKET ###########2")
     ram.peer_server = new ws_api.Server({ port: node.peerport });
     ram.peer_server.on('connection', on_peer_connection)
     ram.peer_server.on('close', on_peer_close)
 
-    console.log("NEW SOCKET ###########3")
     var ws_self = new ws_api('ws://0.0.0.0:'+node.peerport)
     ws_self._self = true
     ws_self.on('open',((w)=>{return ()=>{on_peer_connection(w)}})(ws_self))        
     
     if (node.pubport) {
-        console.log("NEW SOCKET ###########4")
         ram.public_server = new ws_api.Server({ port: node.pubport });
         ram.public_server.on('connection', on_public_connection)
         ram.public_server.on('close', on_public_close)
@@ -360,15 +357,13 @@ function peer_connection_watchdog() {
         if (peer_ips[i]) delete peer_ips[i]
     }
 
-    dbg('peer connections', Object.keys(ram.peer_connections))
-    dbg('peer connections to retry', Object.keys(peer_ips))
+    dbg('peer connections ' + Object.keys(ram.peer_connections).length/2)
 
     // finally attempt new connections to anyone left on the list
     for (var i in peer_ips) {
         var ws = false
         var url = 'ws://' + i 
         try {
-            console.log("NEW SOCKET ###########1")
             ws = new ws_api(url)
             ws.on('error', e=>{
                 warn('attempted to connect to peer ' + i + ' but could not connect')
@@ -411,8 +406,6 @@ function on_public_close(ws) {
 
 function on_public_connection(ws) {
 
-    console.log('public connected !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-
     if (!node.pubport) die('received a public connection even though public port was not specified')
     //todo: filter by abuse/ip here to stop ddos
     ram.public_connections_unauthed[ws._socket.remoteAddress + ":" + ws._socket.remotePort] = ws
@@ -425,8 +418,6 @@ function on_public_connection(ws) {
     ws._challenge = challenge
 
     ws.on('close', () => {
-
-        console.log("public disconnected @@@@@@@@@@@@@")
 
         if (ram.public_connections_authed[ws._authed]) {
             console.log('removing from authed')
@@ -524,7 +515,7 @@ function prune_cache_watchdog() {
 
 function on_peer_connection(ws) {
     //todo: filter to by ip ensure peer is on peer list
-    console.log('peer connected *****************************************')
+    dbg('peer connected *****************************************')
     ram.peer_connections[ws._socket.remoteAddress + ":" + ws._socket.remotePort] = ws
     ws.on('message', (message)=> {
 
@@ -1089,14 +1080,19 @@ function consensus() {
                                  ( ram.consensus.stage == 3 ? 0.80 * node.unl.length : -1 )))
 
 
+            // todo: check if inputs being proposed by another node are actually spoofed inputs
+            // from a user locally connected to this node, if they are publish a repuduation?
+
+            // if we're at proposal stage 1 we'll accept any input and connection that has 1 or more vote            
 
             for (var i in votes.con)
-                if (votes.con[i] >= vote_threshold)
+                if (votes.con[i] >= vote_threshold || votes.con[i] > 0 && ram.consensus.stage == 1)
                     proposal.con.push(i)
 
             for (var i in votes.inp)
-                if (votes.inp[i] >= vote_threshold)
+                if (votes.inp[i] >= vote_threshold || votes.inp[i] > 0 && ram.consensus.stage == 1)
                     proposal.inp.push(i)
+
 
             for (var i in votes.out)
                 if (votes.out[i] >= vote_threshold)
@@ -1282,6 +1278,7 @@ function run_contract_binary(inputs) {
         // compile a list of pipes and users to provide to the contract as stdin
         fdlist += user + '=' + pipes.childread + ":" + pipes.childwrite + '\n'
 
+        dbg('pipes', pipes)
     }
 
     console.log(fdlist)
