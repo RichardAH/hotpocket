@@ -801,6 +801,8 @@ function wait_for_proposals(reset) {
 
 function check_lcl_votes(lcl_votes) {
 
+    var time = Math.floor(Date.now()/1000)
+    
     var total_votes = 0 
     for (var i in lcl_votes)
             total_votes += lcl_votes[i]
@@ -809,10 +811,9 @@ function check_lcl_votes(lcl_votes) {
         return true 
 
     if (total_votes < node.unl.length * 0.8) {
-            var time = Math.floor(Date.now()/1000)
             if (ram.consensus.last_not_enough_peer_msg && 
                 time - ram.consensus.last_not_enough_peer_msg > 10) {
-                ram.consensus.last_not_enough_peer_msg = Date.now()
+                ram.consensus.last_not_enough_peer_msg = time
                 warn('not enough peers proposing to perform consensus (' + total_votes + ' out of ' + node.unl.length + 
                      ', need ' + Math.ceil(node.unl.length*0.8) + ')')
             }
@@ -825,8 +826,13 @@ function check_lcl_votes(lcl_votes) {
 
     if ( winning_votes / total_votes < 0.8) 
     {
-        // fork condition
-        die('no consensus on lcl, fatal. votes were: ' + JSON.stringify(lcl_votes)) 
+        // potential fork condition
+        if (ram.consensus.last_lcl_fatal &&
+            time - ram.consensus.last_lcl_fatal > 10) {
+            ram.consensus.last_lcl_fatal = time
+            warn('no consensus on lcl, fatal. votes were: ' + JSON.stringify(lcl_votes)) 
+        }
+        return false
     }
 
     // execution to here means the winning_lcl has 80%+ support
@@ -1120,6 +1126,7 @@ function consensus() {
                 delete proposal.pubkey
                 delete proposal.timestamp
                 delete proposal.sig
+                delete proposal.stage
 
                 var ledger = JSON.stringify(proposal, get_all_keys(proposal))
 
