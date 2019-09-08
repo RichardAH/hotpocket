@@ -703,10 +703,54 @@ function on_peer_connection(ws) {
             broadcast_to_peers(message)
         } else if (msg.type == 'sta_req' && contains_keys(msg, 'sta')) {
 
-            //todo: process req
+            //todo: all state transfer mechanisms in this prototype scale very very poorly
+            // design or recycle an incremental state transfer scheme for production            
+
+            var response = {
+                type: 'sta_resp',
+                sta: {},
+                req: msg.sta
+            }
+
+            // check if we have the files they want and compile them into a reply message
+            var file_count = 0
+            for ( var fn in msg.sta ) {
+                if (fn.match(/\/\./)) 
+                    return warn('peer requested state including forbidden filenames')
+                    //todo: consider punishing
+                    
+                var stat = fs.statSync( node.dir + '/state/' + fn )                
+                if (!stat || !stat.isFile())
+                    return warn('peer requested state file which wasn\'t a file: ' + fn) 
+
+                //todo: this will absolutely break on large files, this needs to be revised
+                //as a matter of priority for production
+                response.sta[node.dir + '/state/' + fn]
+                    = sodium.to_hex(fs.readFileSync( node.dir + '/state/' + fn ))                
+
+                ++file_count
+            }
+
+            // send the reply back
+            if (file_count > 0)
+               return ws.send(sign_peer_message(response).signed) 
+
         } else if (msg.type == 'sta_resp' && contains_keys(msg, 'sta')) {
 
-            //todo: process resp
+            // first check if we actually asked for a state transfer
+           
+            if (ram.consensus.last_state_request != JSON.stringify(msg.sta, get_all_keys(msg.sta))) 
+                return warn('peer sent us a state response, but we didn\'t ask for one or it didn\'t match the one we did ask for')
+
+            // now write all the files sent
+            for (var fn in msg.sta) 
+                fs.writeFileSync(node.dir + '/state/' + fn, Buffer.from(msg.sta[fn], 'hex'))
+           
+            // finally we can update our current state hash 
+            ram.consensus.local_directory_state = generate_directory_state(node.dir + '/state', true, prune_state_dir)
+
+            dbg('state transfer received and applied')
+
         } else if (msg.type == 'hist_req' && contains_keys(msg, 'lcl')) {
             // a history request message specifies the last closed ledger that the peer knew of
             // this node will retreive that ledger if it can and all newer ledgers it has and send these
@@ -942,7 +986,8 @@ function request_missing_state(diff) {
         type: "sta_req",
         sta: file_requests
     }
-    ram.consensus.last_state_request[SHA512(JSON.stringify(file_requests, get_all_keys), 'STATEREQ')] = Math.floor(Date.now()/1000)
+    ram.consensus.last_state_request = JSON.stringify(file_requests, get_all_keys(file_requests))
+
     var signed_state_request = sign_peer_message(request).signed
     send_to_random_peer(signed_file_request)
 
@@ -1556,7 +1601,7 @@ function init_ram() {
     // this variable contains the lcl of the last ledger requested from a peer
     ram.consensus.last_history_request = false
 
-    // contains hash of last file request sent to a peer
+    // contains the ordered JSON of the last state request sent to a peer
     ram.consensus.last_state_request = {}
 
     // compute local directory state
