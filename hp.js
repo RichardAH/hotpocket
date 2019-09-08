@@ -701,6 +701,12 @@ function on_peer_connection(ws) {
             ram.consensus.proposals[msghash] = msg
             // broadcast it to our peers
             broadcast_to_peers(message)
+        } else if (msg.type == 'sta_req' && contains_keys(msg, 'sta')) {
+
+            //todo: process req
+        } else if (msg.type == 'sta_resp' && contains_keys(msg, 'sta')) {
+
+            //todo: process resp
         } else if (msg.type == 'hist_req' && contains_keys(msg, 'lcl')) {
             // a history request message specifies the last closed ledger that the peer knew of
             // this node will retreive that ledger if it can and all newer ledgers it has and send these
@@ -917,6 +923,32 @@ function wait_for_proposals(reset) {
     ram.consensus.nextsleep = 1// (sodium.randombytes_buf(1)[0]/256)*1000// * node.roundtime 
 }
 
+function request_missing_state(diff) {
+
+    // deal with deletion first, because that's easy
+    for (var fn in diff.deleted)
+        fs.unlinkSync(node.dir + '/state/' + fn)
+
+    // create a list of created and updated files to request
+    var file_requests = {}
+    
+    for (fn in diff.created)
+        file_requests[fn] = diff.created[fn]
+
+    for (fn in diff.updated)
+        file_requests[fn] = diff.updated[fn]
+
+    request = {
+        type: "sta_req",
+        sta: file_requests
+    }
+    ram.consensus.last_state_request[SHA512(JSON.stringify(file_requests, get_all_keys), 'STATEREQ')] = Math.floor(Date.now()/1000)
+    var signed_state_request = sign_peer_message(request).signed
+    send_to_random_peer(signed_file_request)
+
+}
+
+
 /**
     Check our LCL is consistent with the proposals being made by our UNL peers
     lcl_votes -- dictionary mapping lcl -> number of peers who proposed for that lcl
@@ -971,15 +1003,10 @@ function check_lcl_votes(lcl_votes) {
         }
         
         ram.consensus.last_history_request = winning_lcl
-
         var signed_history_request = sign_peer_message(request).signed
-        
         send_to_random_peer(signed_history_request) 
-
         warn('we are not on the consensus ledger, requesting history from a random peer')
-
         return true
-        //todo: catch up state
     }
 
     return false
@@ -1228,6 +1255,11 @@ function consensus() {
                 if (votes.out[i] >= vote_threshold)
                     proposal.out.push(i)
 
+            // sort sta votes
+            votes.sta = JSON.parse(JSON.stringify(votes.sta, get_all_keys))
+
+            // if we have two nodes and they disagree about the state the mathematically
+            // largest hash will now win
             var largest_vote = 0
             for (var i in votes.sta) {
                 if (votes.sta[i] >= vote_threshold && votes.sta[i] > largest_vote) {
@@ -1320,9 +1352,18 @@ function consensus() {
                     // our state diff differs from the consensus state. we will need to resync from a peer
                     
                     warn('contract file state is not on consensus ledger')
-                    // todo: peer resync code
-                    // todo: state_req state_resp messages
-                    // todo: consider including an absolute not just relative hash in the proposed state
+                    dbg('consensus state ' + p.sta)
+                    
+                    if (!ram.consensus.possible_state_dict[p.sta]) {
+                        warn('needed full file state information for file sync but it wasn\'t in our collected state dict')
+                    } else {
+                        var canonical_state = ram.consensus.possible_state_dict[p.sta]
+                        var diff = diff_directory_states(ram.consensus.local_directory_state, canonical_state)
+                        dbg('state diff', diff)
+                        request_missing_state(diff)
+                        ram.consensus.possible_state_dict = {}
+                        return wait_for_proposals(true)
+                    }
                 }
 
                 // and our state change dict
@@ -1514,6 +1555,9 @@ function init_ram() {
 
     // this variable contains the lcl of the last ledger requested from a peer
     ram.consensus.last_history_request = false
+
+    // contains hash of last file request sent to a peer
+    ram.consensus.last_state_request = {}
 
     // compute local directory state
     ram.consensus.local_directory_state = generate_directory_state(node.dir + '/state', true, prune_state_dir)
