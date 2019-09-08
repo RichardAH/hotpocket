@@ -49,7 +49,7 @@ function key_of_highest_value(obj) {
 }
 
 // removes the contract directory from the front of strings
-function prune_node_dir(x)=>{ return x.replace(new RegExp('^' + node.dir), '') }
+function prune_state_dir(x) { return x.replace(new RegExp('^' + node.dir + '/state/'), '') }
 
 function process_cmdline(argv) {
 
@@ -1013,7 +1013,7 @@ function consensus() {
         con: [],
         inp: [],
         out: [],
-        sta: [],
+        sta: "",
         lcl: ram.consensus.lcl,
         stage: ram.consensus.stage
     }
@@ -1071,8 +1071,8 @@ function consensus() {
             for (var user in ram.consensus.local_output_dict) 
                 proposal.out[user] = ram.consensus.local_output_dict[user]
             
-            // propose state change from previous round, if any
-            proposal.sta = ram.consensus.local_directory_state_diff
+            // propose state 
+            proposal.sta = ram.consensus.local_directory_state
 
             broadcast_to_peers(sign_peer_message(proposal).signed)
 
@@ -1093,7 +1093,7 @@ function consensus() {
                 con: {},
                 inp: {},
                 out: {},
-                sta: "",
+                sta: {},
                 lcl: {},
                 stage: {} // this will let us know if we're participating properly in consensus
             }
@@ -1172,10 +1172,11 @@ function consensus() {
                 {
                     var hash = ""
                     if (typeof(p.sta) == "object") {
-                        if (p.stage == 0) {
+                        if (p.stage > 0) {
                             warn("peer proposal attempted to propose a full state in a stage > 0")
+                            dbg('state', p)
                         } else {
-                            hash = SHA512H(JSON.stringify(p.sta, get_all_keys(p.sta)), 'OUTPUT')
+                            hash = SHA512H(JSON.stringify(p.sta, get_all_keys(p.sta)), 'STATE')
                             ram.consensus.possible_state_dict[hash] = p.sta
                         }
                     } else {
@@ -1312,12 +1313,16 @@ function consensus() {
                 ram.consensus.possible_output_dict = {}
 
                 // check the local state we have against the winning state
-                local_state_hash = SHA512H(JSON.stringify(ram.consensus.local_directory_state_diff, get_all_keys(possible_state)), 'STATE')            
+                local_state_hash = SHA512H(JSON.stringify(ram.consensus.local_directory_state, 
+                    get_all_keys(ram.consensus.local_directory_state)), 'STATE')            
 
                 if (p.sta != local_state_hash) {
                     // our state diff differs from the consensus state. we will need to resync from a peer
+                    
                     warn('contract file state is not on consensus ledger')
                     // todo: peer resync code
+                    // todo: state_req state_resp messages
+                    // todo: consider including an absolute not just relative hash in the proposed state
                 }
 
                 // and our state change dict
@@ -1414,20 +1419,11 @@ function run_contract_binary(inputs) {
     for (var i in node.binargs) bin.push(node.binargs[i])
 
 
-    // prior to execution we need to take a directory state, or use previous new state
-    if (!ram.consensus.local_directory_state_new) {
-        ram.consensus.local_directory_state_old = generate_directory_state(node.dir, true, prune_node_dir)
-    } else {
-        ram.consensus.local_directory_state_old = ram.consensus.local_directory_state_new
-    }
 
     var stdout = pipe.rawforkexecclose(childpipesflat, parentpipesflat, bin, fdlist, node.dir)
 
     // after execution take a new state
-    ram.consensus.local_directory_state_new = generate_directory_state(node.dir, true, prune_node_dir)
-
-    // compute the state difference
-    ram.consensus.local_directory_state_diff = diff_directory_states(ram.consensus.local_directory_state_old, ram.consensus.local_directory_state_new)
+    ram.consensus.local_directory_state = generate_directory_state(node.dir + '/state', true, prune_state_dir)
 
     // collect outptuts
     // every connection has an entry in the inputs obj even if its []
@@ -1506,9 +1502,7 @@ function init_ram() {
     ram.consensus.local_output_dict = {}
  
     // this stores local state change
-    ram.consensus.local_directory_state_old = {}
-    ram.consensus.local_directory_state_new = {}
-    ram.consensus.local_directory_state_diff = {}
+    ram.consensus.local_directory_state = {}
 
  
     // set lcl to genesis, this will be override by load_contract usually
@@ -1520,6 +1514,9 @@ function init_ram() {
 
     // this variable contains the lcl of the last ledger requested from a peer
     ram.consensus.last_history_request = false
+
+    // compute local directory state
+    ram.consensus.local_directory_state = generate_directory_state(node.dir + '/state', true, prune_state_dir)
 
 }
 
