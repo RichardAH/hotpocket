@@ -48,6 +48,9 @@ function key_of_highest_value(obj) {
     return null
 }
 
+// removes the contract directory from the front of strings
+function prune_node_dir(x)=>{ return x.replace(new RegExp('^' + node.dir), '') }
+
 function process_cmdline(argv) {
 
     var flags = {}
@@ -693,6 +696,7 @@ function on_peer_connection(ws) {
         // execution to here is a valid peer message
 
         // check what sort of message it is
+        // todo: ensure each peer can send only one proposal for each stage on each lcl!!! important!!!
         if (msg.type == 'proposal' && contains_keys(msg, 'con', 'inp', 'out', 'lcl', 'stage', 'timestamp', 'type')) {
             ram.consensus.proposals[msghash] = msg
             // broadcast it to our peers
@@ -1009,7 +1013,7 @@ function consensus() {
         con: [],
         inp: [],
         out: [],
-        sta: "",
+        sta: [],
         lcl: ram.consensus.lcl,
         stage: ram.consensus.stage
     }
@@ -1040,7 +1044,7 @@ function consensus() {
             // inp = [ hash_of_user_1_inputs, hash_of_user_2_inputs, .. ]
             proposal.inp = {}
             proposal.out = {}
-
+            proposal.sta = {}
 
             for (var i in ram.public_connections_authed) {
                 // add all the connections we host (mentioned by their public key only)
@@ -1067,8 +1071,8 @@ function consensus() {
             for (var user in ram.consensus.local_output_dict) 
                 proposal.out[user] = ram.consensus.local_output_dict[user]
             
-
-            // todo: gather and propose state
+            // propose state change from previous round, if any
+            proposal.sta = ram.consensus.local_directory_state_diff
 
             broadcast_to_peers(sign_peer_message(proposal).signed)
 
@@ -1089,7 +1093,7 @@ function consensus() {
                 con: {},
                 inp: {},
                 out: {},
-                sta: {},
+                sta: "",
                 lcl: {},
                 stage: {} // this will let us know if we're participating properly in consensus
             }
@@ -1120,8 +1124,6 @@ function consensus() {
 
                 //dbg('proposal ' + i, proposals[i])
             
-                inc(votes.sta, p.sta)
-   
                 // todo: no real need for either of these, consider removing
                 inc(votes.lcl, p.lcl)
                 inc(votes.stage, p.stage)
@@ -1149,14 +1151,14 @@ function consensus() {
 
                 // repeat above for outputs
                 for (var j in p.out) {
-                    // inputs are processed as a hash of the JSON of the proposed input
+                    // output are processed as a hash of the JSON of the proposed input
                     var hash = ""
                     if (typeof(p.out[j]) == "object") {
                         // this is a full output proposal, so we need to hash it
 
                         var possible_output = {}
                         possible_output[j] = p.out[j]
-                        hash = SHA512H(JSON.stringify(possible_output), 'OUTPUT')
+                        hash = SHA512H(JSON.stringify(possible_output, get_all_keys(possible_output)), 'OUTPUT')
                         ram.consensus.possible_output_dict[hash] = possible_output
                     } else {
                         // this is already a hash
@@ -1164,6 +1166,25 @@ function consensus() {
                     }
 
                     inc(votes.out, hash)
+                }
+
+                // repeat above for state
+                {
+                    var hash = ""
+                    if (typeof(p.sta) == "object") {
+                        if (p.stage == 0) {
+                            warn("peer proposal attempted to propose a full state in a stage > 0")
+                        } else {
+                            hash = SHA512H(JSON.stringify(p.sta, get_all_keys(p.sta)), 'OUTPUT')
+                            ram.consensus.possible_state_dict[hash] = p.sta
+                        }
+                    } else {
+                        // this is already a hash
+                        hash = p.sta
+                    }
+
+                    if (hash) 
+                        inc(votes.sta, hash)
                 }
 
             }
@@ -1202,25 +1223,19 @@ function consensus() {
                 if (votes.inp[i] >= vote_threshold || votes.inp[i] > 0 && ram.consensus.stage == 1)
                     proposal.inp.push(i)
 
-
             for (var i in votes.out)
                 if (votes.out[i] >= vote_threshold)
                     proposal.out.push(i)
 
-            var largest_count = 0 
-            for (var i in votes.sta)
-                if (votes.sta[i] > largest_count) {
+            var largest_vote = 0
+            for (var i in votes.sta) {
+                if (votes.sta[i] >= vote_threshold && votes.sta[i] > largest_vote) {
+                    largest_vote = votes.sta[i]
                     proposal.sta = i
-                    largest_count = votes.sta[i]
                 }
+            }
 
-            largest_count = 0 
-            for (var i in votes.lcl)
-                if (votes.lcl[i] > largest_count) {
-                    proposal.lcl = i
-                    largest_count = votes.lcl[i]
-                }
-
+            proposal.lcl = ram.consensus.lcl
 
 
             // todo: the way lcl and state are negotitated using a simple threshold is probably wrong
@@ -1231,7 +1246,6 @@ function consensus() {
 
             // finally send the proposal to peers
             broadcast_to_peers(peer_msg.signed) 
-
 
 
             if (ram.consensus.stage == 3) {
@@ -1255,17 +1269,13 @@ function consensus() {
                 // lcl = last closed ledger
                 var lcl = SHA512H( ledger, 'LEDGER' )
             
-                //console.log("trying to write lcl: " + node.dir + '/hist/' + lcl)
                 dbg('last closed ledger: ' + lcl)
-            
-                //fs.writeFileSync( node.dir + '/hist/' + lcl, ledger )
 
                 var fd = fs.openSync( node.dir + '/hist/' + lcl, 'w' )
                 fs.writeSync(fd, ledger)
                 fs.closeSync(fd)
 
                 ram.consensus.lcl = lcl
-
 
                 // first send out any relevant output from the previous consensus round and execution
                 for (var i in proposal.out) {
@@ -1275,8 +1285,6 @@ function consensus() {
                         warn('output required ' + hash + ' but wasn\'t in our possible output dict, this will potentially cause desync')
                         continue // todo: consider fatal
                     }
-
-
 
                     for (var user in ram.consensus.possible_output_dict[hash]) {
                         // there'll be just the one key
@@ -1293,7 +1301,7 @@ function consensus() {
                         for (var j in ram.public_connections_authed) {
                             if (j.replace(/^.*;/, '') == user) {
                                 // this is our locally connected user, send his contract output to him
-                                ram.public_connections_authed[j].send(output)//Uint8Array.from(Buffer.from(output, 'hex')))
+                                ram.public_connections_authed[j].send(output)
                                 break
                             }
                         }
@@ -1303,6 +1311,17 @@ function consensus() {
                 // now we can safely clear our output dictionary
                 ram.consensus.possible_output_dict = {}
 
+                // check the local state we have against the winning state
+                local_state_hash = SHA512H(JSON.stringify(ram.consensus.local_directory_state_diff, get_all_keys(possible_state)), 'STATE')            
+
+                if (p.sta != local_state_hash) {
+                    // our state diff differs from the consensus state. we will need to resync from a peer
+                    warn('contract file state is not on consensus ledger')
+                    // todo: peer resync code
+                }
+
+                // and our state change dict
+                ram.consensus.possible_state_dict = {}
 
                 // structure we need to provide to the contract binary run routine:
                 // { user_pub_key: [ stream of raw input or empty if no input is available ] }
@@ -1395,11 +1414,20 @@ function run_contract_binary(inputs) {
     for (var i in node.binargs) bin.push(node.binargs[i])
 
 
-    //dbg('Contract Execution: ' + bin)
+    // prior to execution we need to take a directory state, or use previous new state
+    if (!ram.consensus.local_directory_state_new) {
+        ram.consensus.local_directory_state_old = generate_directory_state(node.dir, true, prune_node_dir)
+    } else {
+        ram.consensus.local_directory_state_old = ram.consensus.local_directory_state_new
+    }
 
     var stdout = pipe.rawforkexecclose(childpipesflat, parentpipesflat, bin, fdlist, node.dir)
-    //var stdout = ""
-    //console.log(stdout)
+
+    // after execution take a new state
+    ram.consensus.local_directory_state_new = generate_directory_state(node.dir, true, prune_node_dir)
+
+    // compute the state difference
+    ram.consensus.local_directory_state_diff = diff_directory_states(ram.consensus.local_directory_state_old, ram.consensus.local_directory_state_new)
 
     // collect outptuts
     // every connection has an entry in the inputs obj even if its []
@@ -1470,10 +1498,19 @@ function init_ram() {
 
     // as above
     ram.consensus.possible_output_dict = {}
+    
+    // as above
+    ram.consensus.possible_state_dict = {}
 
     // this stores the result of local execution for proposal in stage 0 
     ram.consensus.local_output_dict = {}
-  
+ 
+    // this stores local state change
+    ram.consensus.local_directory_state_old = {}
+    ram.consensus.local_directory_state_new = {}
+    ram.consensus.local_directory_state_diff = {}
+
+ 
     // set lcl to genesis, this will be override by load_contract usually
     ram.consensus.lcl = 'genesis' 
 
