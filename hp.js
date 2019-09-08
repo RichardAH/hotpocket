@@ -5,7 +5,7 @@ const sodium = require('libsodium-wrappers')
 const crypto = require('crypto')
 const pipe = require('posix-pipe-fork-exec')
 const readline = require('readline')
-
+const jsdiff = require('diff')
 
 // sodium has a trigger when it's ready, we will wait and execute from there
 sodium.ready.then(main).catch((e)=>{console.log(e)})
@@ -75,6 +75,116 @@ function process_cmdline(argv) {
     else if (flags.k) rekey_contract()
 
 }
+
+/** 
+    Generates a flat map of paths under the specified directory to SHA512 half of the file
+    fn_prune_func if present is applied to filenames (keys)
+**/
+function generate_directory_state(dir, nojson, fn_prune_func) {
+
+    var output = {}
+    var entries = fs.readdirSync(dir)
+
+    for (var i in entries) {
+        if (entries[i].match(/^\./)) continue
+        var stat = {}
+        try {
+            stat = fs.statSync(dir + '/' + entries[i])
+        } catch(e) {
+            warn('could  not stat ' + dir + '/' + entries[i] + ' for state generation, this will likely cause a desync')
+            continue
+        }
+
+        // if the entry is a directory we will recurse into it
+        if (stat.isDirectory()) {
+            output = Object.assign({}, output, generate_directory_state(dir + '/' + entries[i], true, fn_prune_func) )
+            continue
+        }
+
+        // if the entry is a file we will generate sha512half of it
+        if (stat.isFile()) {
+            var fd = -1
+            try {
+                fd = fs.openSync(dir + '/' + entries[i])
+            } catch (e) {
+                warn('could not open ' + dir + '/' + entries[i] + ' for reading, this will likely cause a desync')
+                continue
+            }
+
+            // read up to 64 mb at a time
+            const max_read = 64*1024*1024
+            var hasher = crypto.createHash('sha512')
+            var buffer = Buffer.alloc(max_read)
+            var bytes_read = 0
+            
+
+            while ( (bytes_read = fs.readSync(fd, buffer, 0, max_read, null)) > 0 ) {
+                var partial_buffer = (bytes_read == max_read ? buffer : buffer.slice(0, bytes_read) )
+                hasher.update( (bytes_read == max_read ? buffer : buffer.slice(0, bytes_read) ) )
+            }
+                            
+
+            try {
+                fs.closeSync(fd)
+            } catch(e) {}
+
+            var fn = dir + '/' + entries[i]
+            if (fn_prune_func)  {
+                fn = fn_prune_func(fn)
+                if (!fn) continue
+            }
+            output[fn] = hasher.digest('hex').slice(0,64)
+            continue
+        }
+
+        warn('ignoring ' + dir + '/' + entries[i] + ' as it does not appear to be either a directory or a file')
+    }
+
+    // this is to ensure keys are sorted in the output
+    return ( nojson ? JSON.parse(JSON.stringify(output, get_all_keys(output))) : JSON.stringify(output, get_all_keys(output)) )
+}
+
+/**
+    Given an old directory state and a new directory state produces an object
+    containing created, updated and deleted arrays, which contain the
+    respective state keys and values 
+**/
+function diff_directory_states(old_state, new_state) {
+
+    try {
+        old_state = (typeof(old_state) == 'string' ? JSON.parse(old_state) : old_state)
+        new_state = (typeof(new_state) == 'string' ? JSON.parse(new_state) : new_state)
+    } catch (e) {
+        warn('attempted to diff states but one of the states was not valid json or an object')
+    }
+ 
+    var output = {
+        created: {},
+        updated: {},
+        deleted: {}
+    } 
+
+    var new_files = Object.keys(new_state).sort()
+    var old_files = Object.keys(old_state).sort()
+
+    var array_diff_result = jsdiff.diffArrays(old_files, new_files)
+    for (var i in array_diff_result) {
+        var adr = array_diff_result[i]
+        for (var j in adr.value) {
+            var fn = adr.value[j]
+            var hash = (adr.added ? new_state[fn] : old_state[fn])
+            var action = (adr.added ? 'created' : ( adr.removed ?  'deleted' : 'updated' ) )
+            // check if there was an actual update
+            if (action == 'updated' && new_state[fn] == old_state[fn])
+                    continue
+            
+            output[ action ][fn] = hash
+        }
+    }
+
+    return output
+}
+
 
 
 function create_contract() {
@@ -1279,7 +1389,7 @@ function run_contract_binary(inputs) {
 
     }
 
-    //console.log(fdlist)
+    console.log(fdlist)
 
     var bin = [ node.binary ]
     for (var i in node.binargs) bin.push(node.binargs[i])
