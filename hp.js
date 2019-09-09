@@ -1183,6 +1183,8 @@ function consensus() {
                 patch: ram.state.patch
             }
 
+            //dbg('novel proposal', proposal)
+
             broadcast_to_peers(sign_peer_message(proposal).signed)
 
             break
@@ -1293,8 +1295,7 @@ function consensus() {
                         hash = p.sta
                     }
 
-                    if (hash) 
-                        inc(votes.sta, hash)
+                    inc(votes.sta, hash)
                 }
 
             }
@@ -1338,7 +1339,7 @@ function consensus() {
                     proposal.out.push(i)
 
             // sort sta votes
-            votes.sta = JSON.parse(JSON.stringify(votes.sta, get_all_keys))
+            votes.sta = JSON.parse(JSON.stringify(votes.sta, get_all_keys(votes.sta)))
 
             // if we have two nodes and they disagree about the state the mathematically
             // largest hash will now win
@@ -1429,7 +1430,7 @@ function consensus() {
 
                 // check our state against the winning / canonical state
                 var curr = SHA512H(JSON.stringify(ram.state.hash, get_all_keys(ram.state.hash)), 'STATE')
-                var canonical = ram.consensus.possible_state_dict[p.sta]
+                var canonical = ram.consensus.possible_state_dict[proposal.sta]
                 if (!canonical) {
                     warn('could not find consensus state in our possible state dict, this will cause desync')
                 } else if (canonical.curr != curr) {
@@ -1441,6 +1442,7 @@ function consensus() {
                         // file system isn't in sync, but our previous state is, so do a roll back to that 
                         warn('our file state differed from consensus, rolling back and patching now')
                         rollback_state() 
+
                         apply_state_patch(node.dir + '/state' , canonical.patch)
 
                         // now we should have the canonical state, but let's double check if that's true
@@ -1474,15 +1476,6 @@ function consensus() {
                         return wait_for_proposals(true)
                     }
                 }
-
-                //todo: comparse state hash with canonical state hash (stage 3 proposal hash)
-                //todo: fix state request and response messages
-                //todo: apply copy new state structure from proposal into ram for next execution,
-                // note: state data does not need to be applied here as it will be applied before contract
-                // execution
-
-
-                            
 
                 // and our state change dict
                 ram.consensus.possible_state_dict = {}
@@ -1620,13 +1613,34 @@ function apply_state_patch(dir, patch) {
     for (var fn in patch) {
         // write the patch file
         // todo: fork bsdiff so we don't have to write a temp file first
+
+        var path = dir + '/' + fn       
+ 
+        // first check if the target file exists
+        var stat = false
         try {
-            var patchfn = node.dir + dir + '/.tmp_patch'
-            fs.writeFileSync(patchfn, ram.state.patch[fn])
-            bsdiff.patchSync(dir + '/' + fn, dir + '/' + fn, patchfn)
+            stat = fs.statSync(path)
+        } catch (e) {}
+
+        // file doesn't exist so we'll create a blank file to apply patch to
+        if (!stat)
+           fs.writeFileSync(path, Buffer.alloc(0)) 
+
+        var patchfn = dir + '/.tmp_patch'
+        try {
+            dbg('patch[' + fn + ']', patch[fn])
+            fs.writeFileSync(patchfn, Buffer.from(patch[fn], 'hex'))
+        } catch (e) {
+            warn('tried to apply a patch to /' + path + ' but could not, this will probably cause a desync (1)')
+            console.log(e)
+        }
+
+        try {
+            bsdiff.patchSync(path, path, patchfn)
             fs.unlinkSync(patchfn)
         } catch (e) {
-            warn('tried to apply a patch to /' + dir + '/' + fn + ' but could not, this will probably cause a desync')
+            warn('tried to apply a patch to /' + path + ' but could not, this will probably cause a desync (2)')
+            console.log(e)
         }
     }
 }
@@ -1705,11 +1719,12 @@ function prepare_state_before_execution() {
         // todo: fork bsdiff so we don't have to write a temp file first
         try {
             var patchfn = node.dir + '/.prev_state/.tmp_patch'
-            fs.writeFileSync(patchfn, ram.state.patch[fn])
+            fs.writeFileSync(patchfn, Buffer.from(ram.state.patch[fn], 'hex'))
             bsdiff.patchSync(node.dir + '/.prev_state/' + fn, node.dir + '/.prev_state/' + fn, patchfn)
             fs.unlinkSync(patchfn)
         } catch (e) {
-            warn('tried to apply a patch to /.prev_state/' + fn + ' but could not, this will probably cause a desync') 
+            warn('tried to apply a patch to /.prev_state/' + fn + ' but could not, this will probably cause a desync (3)') 
+            console.log(e)
         }
     }   
 
@@ -1734,25 +1749,26 @@ function handle_state_after_execution() {
     ram.state.hash = {}
 
     for (var fn in new_modified_times) {
-        if (new_modified_times[fn] > ram.state.modified[fn] ) {
+        if (new_modified_times[fn] != ram.state.modified[fn] ) {
+            dbg('file modified: '  + fn + ' ' + new_modified_times[fn] + ' > ' + ram.state.modified[fn])
             // this file was modified, we need to take a bsdiff
             var patchfn = node.dir + '/.prev_state/.tmp_patch'
             var stat = false
             try {
                 stat =fs.statSync(node.dir + '/.prev_state/' + fn)
             } catch (e) {}
-            if (!fs.statSync(node.dir + '/.prev_state/' + fn)) {
+            if (!stat) {
                 // this is a new file, it didn't exist last run
                 // to facilitate its creationg in other nodes we'll produce a dummy file
                 // and then generate a patch against it
-                fs.writeFileSync(node + '/.prev_state/' + fn, Buffer.from([]))
+                fs.writeFileSync(node.dir + '/.prev_state/' + fn, Buffer.from([]))
             }
 
             // todo: modify bsdiff to take state in memory
             bsdiff.diffSync(node.dir + '/.prev_state/' + fn, node.dir + '/state/' + fn, patchfn)
 
             // read the patch
-            ram.state.patch[fn] = fs.readFileSync(patchfn)
+            ram.state.patch[fn] = sodium.to_hex(fs.readFileSync(patchfn))
             fs.unlinkSync(patchfn)
 
             // generate new hash
