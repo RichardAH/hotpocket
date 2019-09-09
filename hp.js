@@ -6,6 +6,8 @@ const crypto = require('crypto')
 const pipe = require('posix-pipe-fork-exec')
 const readline = require('readline')
 const jsdiff = require('diff')
+const fse = require('fs-extra')
+const bsdiff = require('bsdiff-nodejs')
 
 // sodium has a trigger when it's ready, we will wait and execute from there
 sodium.ready.then(main).catch((e)=>{console.log(e)})
@@ -49,7 +51,7 @@ function key_of_highest_value(obj) {
 }
 
 // removes the contract directory from the front of strings
-function prune_state_dir(x) { return x.replace(new RegExp('^' + node.dir + '/state/'), '') }
+function prune_state_dir(x) { return x.replace(new RegExp('^' + node.dir + '/(\.prev_)?state/'), '') }
 
 function process_cmdline(argv) {
 
@@ -79,11 +81,55 @@ function process_cmdline(argv) {
 
 }
 
-/** 
-    Generates a flat map of paths under the specified directory to SHA512 half of the file
-    fn_prune_func if present is applied to filenames (keys)
+
+/**
+    Return the modified file timestamp
 **/
-function generate_directory_state(dir, nojson, fn_prune_func) {
+function get_modified_time(fn) {
+    var stat = fs.statSync(fn)
+    if (!stat) {
+        warn('tried to get modified time of ' + fn + ' but file couldn\'t be accessed, this may cause desync')
+        return 0
+    }
+    return stat.mtimeMs
+}
+
+/**
+    Generates an SHA512 half of the specified file
+**/
+function generate_file_hash(fn) {
+    var fd = -1
+    try {
+        fd = fs.openSync(fn)
+    } catch (e) {
+        warn('could not open ' + fn + ' for reading, this will likely cause a desync')
+        return false
+    }
+
+    // read up to 64 mb at a time
+    const max_read = 64*1024*1024
+    var hasher = crypto.createHash('sha512')
+    var buffer = Buffer.alloc(max_read)
+    var bytes_read = 0
+
+    while ( (bytes_read = fs.readSync(fd, buffer, 0, max_read, null)) > 0 ) {
+        var partial_buffer = (bytes_read == max_read ? buffer : buffer.slice(0, bytes_read) )
+        hasher.update( (bytes_read == max_read ? buffer : buffer.slice(0, bytes_read) ) )
+    }
+
+    try {
+        fs.closeSync(fd)
+    } catch(e) {}
+
+    return hasher.digest('hex').slice(0,64)
+}
+
+
+/** 
+    Generates a flat map of paths under the specified directory to the mapping_func
+    e.g { 'blah/a' => mapping_func('blah/a') }
+**/
+function generate_directory_state(dir, nojson, mapping_func, fn_prune_func) {
 
     var output = {}
     var entries = fs.readdirSync(dir)
@@ -100,43 +146,19 @@ function generate_directory_state(dir, nojson, fn_prune_func) {
 
         // if the entry is a directory we will recurse into it
         if (stat.isDirectory()) {
-            output = Object.assign({}, output, generate_directory_state(dir + '/' + entries[i], true, fn_prune_func) )
+            output = Object.assign({}, output, generate_directory_state(dir + '/' + entries[i], true, mapping_func, fn_prune_func) )
             continue
         }
 
         // if the entry is a file we will generate sha512half of it
         if (stat.isFile()) {
-            var fd = -1
-            try {
-                fd = fs.openSync(dir + '/' + entries[i])
-            } catch (e) {
-                warn('could not open ' + dir + '/' + entries[i] + ' for reading, this will likely cause a desync')
-                continue
-            }
-
-            // read up to 64 mb at a time
-            const max_read = 64*1024*1024
-            var hasher = crypto.createHash('sha512')
-            var buffer = Buffer.alloc(max_read)
-            var bytes_read = 0
-            
-
-            while ( (bytes_read = fs.readSync(fd, buffer, 0, max_read, null)) > 0 ) {
-                var partial_buffer = (bytes_read == max_read ? buffer : buffer.slice(0, bytes_read) )
-                hasher.update( (bytes_read == max_read ? buffer : buffer.slice(0, bytes_read) ) )
-            }
-                            
-
-            try {
-                fs.closeSync(fd)
-            } catch(e) {}
-
             var fn = dir + '/' + entries[i]
+            var value = mapping_func(fn)
             if (fn_prune_func)  {
                 fn = fn_prune_func(fn)
                 if (!fn) continue
             }
-            output[fn] = hasher.digest('hex').slice(0,64)
+            output[fn] = value
             continue
         }
 
@@ -148,11 +170,9 @@ function generate_directory_state(dir, nojson, fn_prune_func) {
 }
 
 /**
-    Given an old directory state and a new directory state produces an object
-    containing created, updated and deleted arrays, which contain the
-    respective state keys and values 
+    Generates a diff between an old object and a new object
 **/
-function diff_directory_states(old_state, new_state) {
+function diff_objects(old_state, new_state) {
 
     try {
         old_state = (typeof(old_state) == 'string' ? JSON.parse(old_state) : old_state)
@@ -725,7 +745,7 @@ function on_peer_connection(ws) {
 
                 //todo: this will absolutely break on large files, this needs to be revised
                 //as a matter of priority for production
-                response.sta[node.dir + '/state/' + fn]
+                response.hash[node.dir + '/state/' + fn]
                     = sodium.to_hex(fs.readFileSync( node.dir + '/state/' + fn ))                
 
                 ++file_count
@@ -744,10 +764,11 @@ function on_peer_connection(ws) {
 
             // now write all the files sent
             for (var fn in msg.sta) 
-                fs.writeFileSync(node.dir + '/state/' + fn, Buffer.from(msg.sta[fn], 'hex'))
+                fs.writeFileSync(node.dir + '/state/' + fn, Buffer.from(msg.hash[fn], 'hex'))
            
             // finally we can update our current state hash 
-            ram.consensus.local_directory_state = generate_directory_state(node.dir + '/state', true, prune_state_dir)
+            //todo: fix this
+            ram.consensus.local_directory_state = generate_directory_state(node.dir + '/state', true, generate_file_hash, prune_state_dir)
 
             dbg('state transfer received and applied')
 
@@ -1144,7 +1165,38 @@ function consensus() {
                 proposal.out[user] = ram.consensus.local_output_dict[user]
             
             // propose state 
-            proposal.sta = ram.consensus.local_directory_state
+            /*
+                ram.state = {
+                    patch: {},      // fn -> bsdiff patch going from previous state to new state
+                    modified: {},   // fn -> last modified time for each file
+                                    // fn -> hash, after current execution 
+                    hash: {}
+                                    // fn -> hash, previous execution 
+                    prev_hash: {}
+                }
+            */
+
+
+            /* 
+                State proposal anatomy:
+                proposal.sta = {
+                    state: "deadbeef", // this is the hash of the total JSONified up to date ram.state.hash
+                    diff: {
+                        created: { fn => hash },
+                        updated: { fn => hash },
+                        deleted: { fn => hash }
+                    },
+                    patch: {
+                        fn: <hex bspatch data>
+                    }
+                }
+            */
+
+            proposal.sta = {
+                state: SHA512H(JSON.stringify(ram.state.hash, get_all_keys), 'STATE'),
+                diff: diff_objects(ram.state.prev_hash, ram.state.hash),
+                patch: ram.state.patch
+            }
 
             broadcast_to_peers(sign_peer_message(proposal).signed)
 
@@ -1210,7 +1262,7 @@ function consensus() {
                         // this is a full input proposal, so we need to hash it
                         var possible_input = {}
                         possible_input[j] = p.inp[j]
-                        hash = SHA512H(JSON.stringify(possible_input), 'INPUT')
+                        hash = SHA512H(JSON.stringify(possible_input), 'INP')
                         ram.consensus.possible_input_dict[hash] = possible_input
 
                     } else {
@@ -1230,7 +1282,7 @@ function consensus() {
 
                         var possible_output = {}
                         possible_output[j] = p.out[j]
-                        hash = SHA512H(JSON.stringify(possible_output, get_all_keys(possible_output)), 'OUTPUT')
+                        hash = SHA512H(JSON.stringify(possible_output, get_all_keys(possible_output)), 'OUT')
                         ram.consensus.possible_output_dict[hash] = possible_output
                     } else {
                         // this is already a hash
@@ -1248,7 +1300,7 @@ function consensus() {
                             warn("peer proposal attempted to propose a full state in a stage > 0")
                             dbg('state', p)
                         } else {
-                            hash = SHA512H(JSON.stringify(p.sta, get_all_keys(p.sta)), 'STATE')
+                            hash = SHA512H(JSON.stringify(p.sta, get_all_keys(p.sta)), 'STA')
                             ram.consensus.possible_state_dict[hash] = p.sta
                         }
                     } else {
@@ -1349,6 +1401,7 @@ function consensus() {
             
                 dbg('last closed ledger: ' + lcl)
 
+                // write the new lcl to history
                 var fd = fs.openSync( node.dir + '/hist/' + lcl, 'w' )
                 fs.writeSync(fd, ledger)
                 fs.closeSync(fd)
@@ -1390,26 +1443,18 @@ function consensus() {
                 ram.consensus.possible_output_dict = {}
 
                 // check the local state we have against the winning state
-                local_state_hash = SHA512H(JSON.stringify(ram.consensus.local_directory_state, 
-                    get_all_keys(ram.consensus.local_directory_state)), 'STATE')            
+                statehash = SHA512H(JSON.stringify(ram.state.hash, 
+                    get_all_keys(ram.state.hash)), 'STATE')
 
-                if (p.sta != local_state_hash) {
-                    // our state diff differs from the consensus state. we will need to resync from a peer
-                    
-                    warn('contract file state is not on consensus ledger')
-                    dbg('consensus state ' + p.sta)
-                    
-                    if (!ram.consensus.possible_state_dict[p.sta]) {
-                        warn('needed full file state information for file sync but it wasn\'t in our collected state dict')
-                    } else {
-                        var canonical_state = ram.consensus.possible_state_dict[p.sta]
-                        var diff = diff_directory_states(ram.consensus.local_directory_state, canonical_state)
-                        dbg('state diff', diff)
-                        request_missing_state(diff)
-                        ram.consensus.possible_state_dict = {}
-                        return wait_for_proposals(true)
-                    }
-                }
+                //todo: comparse state hash with canonical state hash (stage 3 proposal hash)
+                //todo: fix state request and response messages
+                //todo: apply copy new state structure from proposal into ram for next execution,
+                // note: state data does not need to be applied here as it will be applied before contract
+                // execution
+
+                //var canonical_state = ram.consensus.possible_state_dict[p.sta]
+
+                            
 
                 // and our state change dict
                 ram.consensus.possible_state_dict = {}
@@ -1505,11 +1550,14 @@ function run_contract_binary(inputs) {
     for (var i in node.binargs) bin.push(node.binargs[i])
 
 
+    prepare_state_before_execution()
+
 
     var stdout = pipe.rawforkexecclose(childpipesflat, parentpipesflat, bin, fdlist, node.dir)
 
-    // after execution take a new state
-    ram.consensus.local_directory_state = generate_directory_state(node.dir + '/state', true, prune_state_dir)
+
+    handle_state_after_execution()
+
 
     // collect outptuts
     // every connection has an entry in the inputs obj even if its []
@@ -1538,6 +1586,124 @@ function run_contract_binary(inputs) {
 
     // these will be proposed in the next novel proposal (stage 0 proposal)
     ram.consensus.local_output_dict = outputs
+}
+
+
+
+
+
+function prepare_state_before_execution() {
+/*
+    ram.state = {
+        patch: {},      // fn -> bsdiff patch going from previous state to new state
+        modified: {},   // fn -> last modified time for each file
+                        // fn -> hash, after current execution 
+        hash: {}
+                        // fn -> hash, previous execution 
+        prev_hash: {}
+    }
+*/
+
+    // check if shadow state directory exists, if it doesn't make it
+    // this will only execute on new contracts, generally speaking
+    var prev_stat = fs.statSync(node.dir + '/.prev_state/')
+    if (!prev_stat) {
+        // directory doesn't exist, we'll need to do a cp -r
+        warn('copy of state not found, making copy now (this is typical for first run)')
+        fse.copySync(node.dir + '/state', node.dir + '/.prev_state')
+        // set up data structures as needed for a first run
+        ram.state.prev_hash = generate_directory_state(node.dir + '/.prev_state', true, generate_file_hash, prune_state_dir)
+        ram.state.hash = ram.state.prev_hash
+        ram.state.patch = {}
+        ram.state.modified = generate_directory_state(node.dir + '/state', true, get_modified_time, prune_state_dir)
+        return
+    }
+
+    // execution to here means there's already a previous state directory
+    // so this is a regular state cycle
+
+    // first let's see if there have been any file additions of deletions since last run
+    var new_modified_times = generate_directory_state(node.dir + '/state', true, get_modified_time, prune_state_dir)  
+    // we can do this by running a key diff between new modified times and previous modified times
+    
+    var diff = diff_objects(ram.state.modified, new_modified_times)
+    
+    // apply creations and deletions
+    for (var fn in diff.created)
+        try { 
+            fse.copySync(node.dir + '/state/' + fn, node.dir + '/.prev_state/' + fn)
+        } catch (e) {
+            warn('tried to copy /state/' + fn + ' but could not, this will probably cause a desync') 
+        }
+    for (var fn in diff.deleted)   
+        try {
+            fs.unlinkSync(node.dir + '/.prev_state/' + fn)
+        } catch (e) {
+            warn('tried to delete /.prev_state/' + fn + ' but could not, this will probably cause a desync')
+        }
+
+
+    // apply any pending patches
+    for (var fn in ram.state.patch) {
+        // write the patch file
+        // todo: fork bsdiff so we don't have to write a temp file first
+        try {
+            var patchfn = node.dir + '/.prev_state/.tmp_patch'
+            fs.writeFileSync(patchfn, ram.state.patch[fn])
+            bsdiff.patchSync(node.dir + '/.prev_state/' + fn, node.dir + '/.prev_state/' + fn, patchfn)
+            fs.unlinkSync(patchfn)
+        } catch (e) {
+            warn('tried to apply a patch to /.prev_state/' + fn + ' but could not, this will probably cause a desync') 
+        }
+    }   
+
+    // clear patches
+    ram.state.patch = {}  
+ 
+    // now the prev state and current state are the same, so copy the sta over
+    ram.state.prev_hash = ram.state.hash
+
+    // ensure last modified times are up to date
+    ram.state.modified = new_modified_times
+
+}
+
+
+function handle_state_after_execution() {
+
+    // contract has executed, first thing we need to look at is the modified times on its state files
+
+    var new_modified_times = generate_directory_state(node.dir + '/state', true, get_modified_time, prune_state_dir)
+
+    ram.state.hash = {}
+
+    for (var fn in new_modified_times) {
+        if (new_modified_times[fn] > ram.state.modified[fn] ) {
+            // this file was modified, we need to take a bsdiff
+            var patchfn = node.dir + '/.prev_state/.tmp_patch'
+            if (!fs.statSync(node.dir + '/.prev_state/' + fn)) {
+                // this is a new file, it didn't exist last run
+                // to facilitate its creationg in other nodes we'll produce a dummy file
+                // and then generate a patch against it
+                fs.writeFileSync(node + '/.prev_state/' + fn, Buffer.from([]))
+            }
+
+            // todo: modify bsdiff to take state in memory
+            bsdiff.diffSync(node.dir + '/.prev_state/' + fn, node.dir + '/state/' + fn, patchfn)
+
+            // read the patch
+            ram.state.patch[fn] = fs.readFileSync(patchfn)
+            fs.unlinkSync(patchfn)
+
+            // generate new hash
+            ram.state.hash[fn] = generate_file_hash(node.dir + '/state/' + fn)
+          
+        } else if (ram.state.prev_hash[fn]) {
+            // copy the old sta for this file since it wasn't modified
+            ram.state.hash[fn] = ram.state.prev_hash[fn]
+        }
+    }
+
 }
 
 
@@ -1586,11 +1752,19 @@ function init_ram() {
 
     // this stores the result of local execution for proposal in stage 0 
     ram.consensus.local_output_dict = {}
- 
-    // this stores local state change
-    ram.consensus.local_directory_state = {}
 
- 
+    // stores information about the progression of the file state under /state/ 
+    // these structures are flat, fn is the full path to the file under /state/
+    ram.state = {
+        patch: {},      // fn -> bsdiff binary patch going from previous state to new state
+        modified: {},   // fn -> last modified time for each file
+                        // fn -> hash, after current execution 
+        hash: {}
+                        // fn -> hash, previous execution 
+        prev_hash: {}
+    }
+
+    
     // set lcl to genesis, this will be override by load_contract usually
     ram.consensus.lcl = 'genesis' 
 
@@ -1603,9 +1777,6 @@ function init_ram() {
 
     // contains the ordered JSON of the last state request sent to a peer
     ram.consensus.last_state_request = {}
-
-    // compute local directory state
-    ram.consensus.local_directory_state = generate_directory_state(node.dir + '/state', true, prune_state_dir)
 
 }
 
