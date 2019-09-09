@@ -1494,7 +1494,6 @@ function apply_ledger(proposal) {
             // state request from our peers before we can continue
 
             request_state_from_peer()
-
             return wait_for_proposals(true)
         }
     }
@@ -1539,12 +1538,11 @@ function apply_ledger(proposal) {
     ram.consensus.possible_input_dict = {}
 
     //todo: check contract state against consensus
-
-    run_contract_binary(concrete_inputs)
+    run_contract_binary(concrete_inputs, proposal)
 
 }
 
-function run_contract_binary(inputs) {
+function run_contract_binary(inputs, proposal) {
 
     var childpipesflat  = []     // pipes.childread, pipes.childwrite ]
     var parentpipesflat = []    // pipes.parentread, pipes.parentwrite ]
@@ -1554,18 +1552,36 @@ function run_contract_binary(inputs) {
 
     /**
         anatomy of a hp fdlist
-
+        note the JSON stringify level must be 1 with whitespace removed, for ease of parsing
+        it also must be key sorted, again to make parsing easy
         {
-            type: 'binexec',        // these entries must come first
             hotpocket: <version>,
-            timestamp: 
+            type: 'binexec', 
+            mver: 1,    
+            time: <utc timestamp>,      // nodes can't use their own time or it will be non deterministic
+            pubkey: <public key hex>,  // this node's public key
+            user: {
+                <public key hex>: [<fd for reading from this user>, <fd for writing to this user>], ...
+            },
+            // these fd's allow the node realtime communication with it's peers through the 
+            // non-consensus-channel NCC message type
+            ncc: {
+                <public key hex>: [<fd for reading from this node>, <fd for writing to this node>], ...
+            }
         }
 
     **/
 
 
-    var fdlist = "HOTPOCKET " + HP_VERSION + "\n"
-
+    var fdlist = {
+        hotpocket: HP_VERSION,
+        type: 'binexec',
+        mver: 1, // this is the message version type    
+        time: proposal.time,
+        pubkey: node.pubkeyhex,
+        ncc: {},
+        user: {}
+    }
 
     for (var user in inputs) {
         var pipes = pipe.PipeDuplex()
@@ -1579,15 +1595,16 @@ function run_contract_binary(inputs) {
         outputpipes[user] = pipes.parentread
 
         // queue up the input on each of the pipes
-        for (var i in inputs[user]) {
-            dbg("writing " + inputs[user][i].length  + " bytes of user input to fd = " + pipes.parentwrite)
+        for (var i in inputs[user]) 
             fs.writeSync(pipes.parentwrite, inputs[user][i])
-        }
 
         // compile a list of pipes and users to provide to the contract as stdin
-        fdlist += user + '=' + pipes.childread + ":" + pipes.childwrite + '\n'
+        fdlist.user[user] = [ pipes.childread, pipes.childwrite ]
 
     }
+    
+    //sort keys and remove whitespace
+    fdlist = JSON.stringify(fdlist, get_all_keys(fdlist), 1).replace(/\n */g, '\n')
 
     console.log(fdlist)
 
