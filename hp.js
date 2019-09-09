@@ -721,54 +721,60 @@ function on_peer_connection(ws) {
             ram.consensus.proposals[msghash] = msg
             // broadcast it to our peers
             broadcast_to_peers(message)
-        } else if (msg.type == 'sta_req' && contains_keys(msg, 'sta')) {
+        } else if (msg.type == 'sta_req' && contains_keys(msg, 'hash')) {
 
-            //todo: all state transfer mechanisms in this prototype scale very very poorly
-            // design or recycle an incremental state transfer scheme for production            
+            // this message requests new state by providing the state the node currrently has
+            // any files that differ will be sent wholesale
+            // todo: figure out a way to efficiently bsdiff these files and send a patch instead
 
             var response = {
                 type: 'sta_resp',
-                sta: {},
-                req: msg.sta
+                req: SHA512H(JSON.stringify(msg.hash, get_all_keys(msg.hash)), 'STATE')      
+                diff: {},
+                copy: {}  // this is like patch except it will contain hex encoded binary data to override the target file
             }
 
-            // check if we have the files they want and compile them into a reply message
-            var file_count = 0
-            for ( var fn in msg.sta ) {
-                if (fn.match(/\/\./)) 
-                    return warn('peer requested state including forbidden filenames')
-                    //todo: consider punishing
-                    
-                var stat = fs.statSync( node.dir + '/state/' + fn )                
-                if (!stat || !stat.isFile())
-                    return warn('peer requested state file which wasn\'t a file: ' + fn) 
+            // first go ahead and diff with our current state
+            response.diff = diff_objects(msg.hash, ram.state.hash)
 
-                //todo: this will absolutely break on large files, this needs to be revised
-                //as a matter of priority for production
-                response.hash[node.dir + '/state/' + fn]
-                    = sodium.to_hex(fs.readFileSync( node.dir + '/state/' + fn ))                
+            // for those files that are updated or created add their contents to the copy object
+            for (var fn in response.diff.created)
+                response.copy[fn] = sodium.to_hex(fs.readFileSync(node.dir + '/state/' + fn))
 
-                ++file_count
-            }
+            for (var fn in response.diff.updated)
+                response.copy[fn] = sodium.to_hex(fs.readFileSync(node.dir + '/state/' + fn))
 
-            // send the reply back
-            if (file_count > 0)
-               return ws.send(sign_peer_message(response).signed) 
+            // now send the reply
+            // todo: test if an extremely large version of this messages needs to be split
+            return ws.send(sign_peer_message(response).signed) 
 
-        } else if (msg.type == 'sta_resp' && contains_keys(msg, 'sta')) {
+        } else if (msg.type == 'sta_resp' && contains_keys(msg, 'req', 'diff', 'copy')) {
 
             // first check if we actually asked for a state transfer
-           
-            if (ram.consensus.last_state_request != JSON.stringify(msg.sta, get_all_keys(msg.sta))) 
-                return warn('peer sent us a state response, but we didn\'t ask for one or it didn\'t match the one we did ask for')
+            if (!ram.state.last_req || Math.floor(Date.now()/1000) - ram.state.last_req > 60) 
+                return warn('peer sent us a state response, but we didn\'t ask for one recently')
+                //todo: we should continue collecting consensus data, in particular patch data while
+                // we wait for this message to arrive
 
-            // now write all the files sent
-            for (var fn in msg.sta) 
-                fs.writeFileSync(node.dir + '/state/' + fn, Buffer.from(msg.hash[fn], 'hex'))
+            if (msg.req != SHA512H(JSON.stringify(ram.state.hash, get_all_keys(ram.state.hash)), 'STATE'))
+                return warn('peer send us a state response but it doesn\'t match our existing state')
+                //todo: punish peer?
+
+            // execution to here means this state response can be used to patch our state 
+
+            // write all the files sent
+            for (var fn in msg.copy) 
+                fs.writeFileSync(node.dir + '/state/' + fn, Buffer.from(msg.copy[fn], 'hex'))
            
-            // finally we can update our current state hash 
-            //todo: fix this
-            ram.consensus.local_directory_state = generate_directory_state(node.dir + '/state', true, generate_file_hash, prune_state_dir)
+            // delete everything that needs deleting according to diff
+            for (var fn in msg.diff.deleted)
+                fs.unlinkSync(node.dir + '/state/' + fn)
+
+            // update state hashes
+            ram.state.hash = generate_directory_state(node.dir + '/state', true, generate_file_hash, prune_state_dir)
+
+            // signal the proposal can resume
+            ram.state.last_req = false
 
             dbg('state transfer received and applied')
 
@@ -988,32 +994,6 @@ function wait_for_proposals(reset) {
     ram.consensus.nextsleep = 1// (sodium.randombytes_buf(1)[0]/256)*1000// * node.roundtime 
 }
 
-function request_missing_state(diff) {
-
-    // deal with deletion first, because that's easy
-    for (var fn in diff.deleted)
-        fs.unlinkSync(node.dir + '/state/' + fn)
-
-    // create a list of created and updated files to request
-    var file_requests = {}
-    
-    for (fn in diff.created)
-        file_requests[fn] = diff.created[fn]
-
-    for (fn in diff.updated)
-        file_requests[fn] = diff.updated[fn]
-
-    request = {
-        type: "sta_req",
-        sta: file_requests
-    }
-    ram.consensus.last_state_request = JSON.stringify(file_requests, get_all_keys(file_requests))
-
-    var signed_state_request = sign_peer_message(request).signed
-    send_to_random_peer(signed_file_request)
-
-}
-
 
 /**
     Check our LCL is consistent with the proposals being made by our UNL peers
@@ -1180,7 +1160,8 @@ function consensus() {
             /* 
                 State proposal anatomy:
                 proposal.sta = {
-                    state: "deadbeef", // this is the hash of the total JSONified up to date ram.state.hash
+                    prev: "aaaabbbb', // as below
+                    curr: "deadbeef", // this is the hash of the total JSONified up to date ram.state.hash
                     diff: {
                         created: { fn => hash },
                         updated: { fn => hash },
@@ -1193,7 +1174,8 @@ function consensus() {
             */
 
             proposal.sta = {
-                state: SHA512H(JSON.stringify(ram.state.hash, get_all_keys), 'STATE'),
+                prev: SHA512H(JSON.stringify(ram.state.prev_hash, get_all_key(ram.state.prev_hash)), 'STATE'),
+                curr: SHA512H(JSON.stringify(ram.state.hash, get_all_keys(ram.state.hash)), 'STATE'),
                 diff: diff_objects(ram.state.prev_hash, ram.state.hash),
                 patch: ram.state.patch
             }
@@ -1442,9 +1424,53 @@ function consensus() {
                 // now we can safely clear our output dictionary
                 ram.consensus.possible_output_dict = {}
 
-                // check the local state we have against the winning state
-                statehash = SHA512H(JSON.stringify(ram.state.hash, 
-                    get_all_keys(ram.state.hash)), 'STATE')
+                // check our state against the winning / canonical state
+                var curr = SHA512H(JSON.stringify(ram.state.hash, get_all_keys(ram.state.hash)), 'STATE')
+                var canonical = ram.consensus.possible_state_dict[p.sta]
+                if (!canonical) {
+                    warn('could not find consensus state in our possible state dict, this will cause desync')
+                } else if (canonical.curr != curr) {
+
+                    // first check to ensure our previous state is the same as the canonical previous state
+                    var prev = SHA512H(JSON.stringify(ram.state.prev_hash, get_all_keys(ram.state.prev_hash)), 'STATE')
+                    if (canonical.prev == prev) {
+                       
+                        // file system isn't in sync, but our previous state is, so do a roll back to that 
+                        warn('our file state differed from consensus, rolling back and patching now')
+                        rollback_state() 
+                        apply_state_patch(node.dir + '/state' , canonical.patch)
+
+                        // now we should have the canonical state, but let's double check if that's true
+                        // if we don't we'll need to request the state
+
+
+                        var hash = generate_directory_state(node.dir + '/state', true, generate_file_hash, prune_state_dir)
+                        
+                        curr = SHA512H(JSON.stringify(hash, get_all_keys(hash)), 'STATE')
+
+                        if (canonical.curr != curr)
+                            die('even after rolling back and applying state patches the file system is not on consensus. fatal!')
+
+                    } else {
+
+                        // the canonical previous state is not the same as our previous state, we'll need to do a
+                        // state request from our peers before we can continue
+
+                        var request = {
+                            type: "sta_req",
+                            hash: ram.state.hash
+                        }
+
+                        // update the last state request flag              
+                        ram.state.last_req = Math.floor(Date.now()/1000)
+
+
+                        //todo: we should continue collecting consensus data, in particular patch data while
+                        // we wait for this message to arriv
+                        send_to_random_peer(sign_peer_message(request).signed)   
+                        return wait_for_proposals(true)
+                    }
+                }
 
                 //todo: comparse state hash with canonical state hash (stage 3 proposal hash)
                 //todo: fix state request and response messages
@@ -1452,7 +1478,6 @@ function consensus() {
                 // note: state data does not need to be applied here as it will be applied before contract
                 // execution
 
-                //var canonical_state = ram.consensus.possible_state_dict[p.sta]
 
                             
 
@@ -1588,9 +1613,35 @@ function run_contract_binary(inputs) {
     ram.consensus.local_output_dict = outputs
 }
 
+function apply_state_patch(dir, patch) {
+    for (var fn in patch) {
+        // write the patch file
+        // todo: fork bsdiff so we don't have to write a temp file first
+        try {
+            var patchfn = node.dir + dir + '/.tmp_patch'
+            fs.writeFileSync(patchfn, ram.state.patch[fn])
+            bsdiff.patchSync(dir + '/' + fn, dir + '/' + fn, patchfn)
+            fs.unlinkSync(patchfn)
+        } catch (e) {
+            warn('tried to apply a patch to /' + dir + '/' + fn + ' but could not, this will probably cause a desync')
+        }
+    }
+}
 
-
-
+function rollback_state() {
+    var new_modified_times = generate_directory_state(node.dir + '/state', true, get_modified_time, prune_state_dir)
+    for (var fn in new_modified_times) {
+        if (ram.state.modified[fn] && !new_modified_times[fn] ||
+            ram.state.modified[fn] < new_modified_times[fn])
+            ) {
+            // file was erronously deleted or modified, so copy it back
+            fse.copySync(node.dir + '/.prev_state/' + fn, node.dir + '/state/' + fn)
+        } else if (!ram.state.modified[fn] && new_modified_times[fn]) {
+            // file was erronously created so delete it
+            fs.unlinkSync(node.dir + '/state/' + fn)
+        }
+    }    
+}
 
 function prepare_state_before_execution() {
 /*
@@ -1761,7 +1812,8 @@ function init_ram() {
                         // fn -> hash, after current execution 
         hash: {}
                         // fn -> hash, previous execution 
-        prev_hash: {}
+        prev_hash: {},
+        last_req: 0
     }
 
     
@@ -1775,8 +1827,6 @@ function init_ram() {
     // this variable contains the lcl of the last ledger requested from a peer
     ram.consensus.last_history_request = false
 
-    // contains the ordered JSON of the last state request sent to a peer
-    ram.consensus.last_state_request = {}
 
 }
 
