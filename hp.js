@@ -766,13 +766,21 @@ function on_peer_connection(ws) {
             // execution to here means this state response can be used to patch our state 
 
             // write all the files sent
-            for (var fn in msg.copy) 
-                fs.writeFileSync(node.dir + '/state/' + fn, Buffer.from(msg.copy[fn], 'hex'))
-           
+            for (var fn in msg.copy)
+                try { 
+                    fs.writeFileSync(node.dir + '/state/' + fn, Buffer.from(msg.copy[fn], 'hex'))
+                } catch (e) {
+                    warn('we were supposed to write a file state/' + fn + ' to catch up state, '+
+                         'but we were unable to, this will probably cause a desync')
+                }
             // delete everything that needs deleting according to diff
             for (var fn in msg.diff.deleted)
-                fs.unlinkSync(node.dir + '/state/' + fn)
-
+                try {
+                    fs.unlinkSync(node.dir + '/state/' + fn)
+                } catch (e) {
+                    warn('we were supposed to delete a file state/' + fn + ' to catch up state, ' +
+                         'but it\'s already gone or couldn\'t be deleted')
+                }
             // update state hashes
             ram.state.hash = generate_directory_state(node.dir + '/state', true, generate_file_hash, prune_state_dir)
 
@@ -1453,26 +1461,20 @@ function consensus() {
                         
                         curr = SHA512H(JSON.stringify(hash, get_all_keys(hash)), 'STATE')
 
-                        if (canonical.curr != curr)
-                            die('even after rolling back and applying state patches the file system is not on consensus. fatal!')
+                        if (canonical.curr != curr) {
+                            warn('even after rolling back and applying state patches the file system is not on consensus, ' +
+                                'requesting state from peer')
 
+                            request_state_from_peer()
+                            return wait_for_proposals(true)
+                        }
                     } else {
 
                         // the canonical previous state is not the same as our previous state, we'll need to do a
                         // state request from our peers before we can continue
 
-                        var request = {
-                            type: "sta_req",
-                            hash: ram.state.hash
-                        }
+                        request_state_from_peer()
 
-                        // update the last state request flag              
-                        ram.state.last_req = Math.floor(Date.now()/1000)
-
-
-                        //todo: we should continue collecting consensus data, in particular patch data while
-                        // we wait for this message to arriv
-                        send_to_random_peer(sign_peer_message(request).signed)   
                         return wait_for_proposals(true)
                     }
                 }
@@ -1607,6 +1609,22 @@ function run_contract_binary(inputs) {
 
     // these will be proposed in the next novel proposal (stage 0 proposal)
     ram.consensus.local_output_dict = outputs
+}
+
+function request_state_from_peer() {
+
+    var request = {
+        type: "sta_req",
+        hash: ram.state.hash
+    }
+
+    // update the last state request flag              
+    ram.state.last_req = Math.floor(Date.now()/1000)
+
+    //todo: we should continue collecting consensus data, in particular patch data while
+    // we wait for this message to arrive
+    send_to_random_peer(sign_peer_message(request).signed)   
+
 }
 
 function apply_state_patch(dir, patch) {
