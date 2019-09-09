@@ -1191,8 +1191,6 @@ function consensus() {
                 patch: ram.state.patch
             }
 
-            //dbg('novel proposal', proposal)
-
             broadcast_to_peers(sign_peer_message(proposal).signed)
 
             break
@@ -1605,7 +1603,6 @@ function run_contract_binary(inputs) {
         try {
          fs.closeSync(childpipesflat[i])
         } catch(e) {}
-    //console.log("stdout of contract: \n" + stdout)
 
     // these will be proposed in the next novel proposal (stage 0 proposal)
     ram.consensus.local_output_dict = outputs
@@ -1646,7 +1643,6 @@ function apply_state_patch(dir, patch) {
 
         var patchfn = dir + '/.tmp_patch'
         try {
-            dbg('patch[' + fn + ']', patch[fn])
             fs.writeFileSync(patchfn, Buffer.from(patch[fn], 'hex'))
         } catch (e) {
             warn('tried to apply a patch to /' + path + ' but could not, this will probably cause a desync (1)')
@@ -1699,6 +1695,9 @@ function prepare_state_before_execution() {
         // directory doesn't exist, we'll need to do a cp -r
         warn('copy of state not found, making copy now (this is typical for first run)')
         fse.copySync(node.dir + '/state', node.dir + '/.prev_state')
+    }
+
+    if (!ram.state.prev_hash) {
         // set up data structures as needed for a first run
         ram.state.prev_hash = generate_directory_state(node.dir + '/.prev_state', true, generate_file_hash, prune_state_dir)
         ram.state.hash = ram.state.prev_hash
@@ -1767,8 +1766,7 @@ function handle_state_after_execution() {
     ram.state.hash = {}
 
     for (var fn in new_modified_times) {
-        if (new_modified_times[fn] != ram.state.modified[fn] ) {
-            dbg('file modified: '  + fn + ' ' + new_modified_times[fn] + ' > ' + ram.state.modified[fn])
+        if (!ram.state.modified[fn] || new_modified_times[fn] > ram.state.modified[fn] ) {
             // this file was modified, we need to take a bsdiff
             var patchfn = node.dir + '/.prev_state/.tmp_patch'
             var stat = false
@@ -1795,8 +1793,10 @@ function handle_state_after_execution() {
         } else if (ram.state.prev_hash[fn]) {
             // copy the old sta for this file since it wasn't modified
             ram.state.hash[fn] = ram.state.prev_hash[fn]
+        } else {
+            ram.state.hash[fn] = generate_file_hash(node.dir + '/state/' + fn)
         }
-    }
+    }   
 
 }
 
@@ -1855,7 +1855,7 @@ function init_ram() {
                         // fn -> hash, after current execution 
         hash: {},
                         // fn -> hash, previous execution 
-        prev_hash: {},
+        prev_hash: false,
         last_req: 0
     }
 
