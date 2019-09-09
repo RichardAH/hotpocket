@@ -86,7 +86,10 @@ function process_cmdline(argv) {
     Return the modified file timestamp
 **/
 function get_modified_time(fn) {
-    var stat = fs.statSync(fn)
+    var stat = false
+    try {
+        stat = fs.statSync(fn)
+    } catch (e) {}
     if (!stat) {
         warn('tried to get modified time of ' + fn + ' but file couldn\'t be accessed, this may cause desync')
         return 0
@@ -729,7 +732,7 @@ function on_peer_connection(ws) {
 
             var response = {
                 type: 'sta_resp',
-                req: SHA512H(JSON.stringify(msg.hash, get_all_keys(msg.hash)), 'STATE')      
+                req: SHA512H(JSON.stringify(msg.hash, get_all_keys(msg.hash)), 'STATE'),
                 diff: {},
                 copy: {}  // this is like patch except it will contain hex encoded binary data to override the target file
             }
@@ -1174,7 +1177,7 @@ function consensus() {
             */
 
             proposal.sta = {
-                prev: SHA512H(JSON.stringify(ram.state.prev_hash, get_all_key(ram.state.prev_hash)), 'STATE'),
+                prev: SHA512H(JSON.stringify(ram.state.prev_hash, get_all_keys(ram.state.prev_hash)), 'STATE'),
                 curr: SHA512H(JSON.stringify(ram.state.hash, get_all_keys(ram.state.hash)), 'STATE'),
                 diff: diff_objects(ram.state.prev_hash, ram.state.hash),
                 patch: ram.state.patch
@@ -1632,8 +1635,7 @@ function rollback_state() {
     var new_modified_times = generate_directory_state(node.dir + '/state', true, get_modified_time, prune_state_dir)
     for (var fn in new_modified_times) {
         if (ram.state.modified[fn] && !new_modified_times[fn] ||
-            ram.state.modified[fn] < new_modified_times[fn])
-            ) {
+            ram.state.modified[fn] < new_modified_times[fn]) {
             // file was erronously deleted or modified, so copy it back
             fse.copySync(node.dir + '/.prev_state/' + fn, node.dir + '/state/' + fn)
         } else if (!ram.state.modified[fn] && new_modified_times[fn]) {
@@ -1657,7 +1659,10 @@ function prepare_state_before_execution() {
 
     // check if shadow state directory exists, if it doesn't make it
     // this will only execute on new contracts, generally speaking
-    var prev_stat = fs.statSync(node.dir + '/.prev_state/')
+    var prev_stat = false
+    try {
+        prev_stat = fs.statSync(node.dir + '/.prev_state')
+    } catch (e) {}
     if (!prev_stat) {
         // directory doesn't exist, we'll need to do a cp -r
         warn('copy of state not found, making copy now (this is typical for first run)')
@@ -1732,6 +1737,10 @@ function handle_state_after_execution() {
         if (new_modified_times[fn] > ram.state.modified[fn] ) {
             // this file was modified, we need to take a bsdiff
             var patchfn = node.dir + '/.prev_state/.tmp_patch'
+            var stat = false
+            try {
+                stat =fs.statSync(node.dir + '/.prev_state/' + fn)
+            } catch (e) {}
             if (!fs.statSync(node.dir + '/.prev_state/' + fn)) {
                 // this is a new file, it didn't exist last run
                 // to facilitate its creationg in other nodes we'll produce a dummy file
@@ -1810,7 +1819,7 @@ function init_ram() {
         patch: {},      // fn -> bsdiff binary patch going from previous state to new state
         modified: {},   // fn -> last modified time for each file
                         // fn -> hash, after current execution 
-        hash: {}
+        hash: {},
                         // fn -> hash, previous execution 
         prev_hash: {},
         last_req: 0
