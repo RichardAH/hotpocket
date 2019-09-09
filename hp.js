@@ -639,7 +639,7 @@ function on_public_connection(ws) {
 
 function prune_cache_watchdog() {
 
-    var time = Date.now()
+    var time = Math.floor(Date.now()/1000)
     for (var i in ram.recent_peer_msghash)
         if (ram.recent_peer_msghash[i] < time - 60)
             delete ram.recent_peer_msghash[i]
@@ -655,7 +655,7 @@ function on_peer_connection(ws) {
     ram.peer_connections[ws._socket.remoteAddress + ":" + ws._socket.remotePort] = ws
     ws.on('message', (message)=> {
 
-        var time = Date.now()
+        var time = Math.floor(Date.now()/1000)
 
         // convert the message to json
         // this is cheap so do this first
@@ -1073,9 +1073,7 @@ function check_lcl_votes(lcl_votes) {
 **/
 function consensus() {
 
-    // wait for entry point into consensus cycles
-    var time = (+ new Date())
-
+    var time = Math.floor(Date.now()/1000)
 
     /**
         A proposal is a json object consisting of 5 sections
@@ -1099,7 +1097,8 @@ function consensus() {
         out: [],
         sta: "",
         lcl: ram.consensus.lcl,
-        stage: ram.consensus.stage
+        stage: ram.consensus.stage,
+        time: time // this differs from the timestamp, it is 'consensus time'
     }
 
 
@@ -1201,19 +1200,9 @@ function consensus() {
         case 3:
     
             var proposals = ram.consensus.proposals
-            
-
             ram.consensus.proposals = {}
 
             
-            var votes = {
-                con: {},
-                inp: {},
-                out: {},
-                sta: {},
-                lcl: {},
-                stage: {} // this will let us know if we're participating properly in consensus
-            }
 
             // we need to consider what our peers believe the LCL is first before we can participate in voting
             // if our peers have different ideas of what the LCL is we might be in a fork condition
@@ -1235,15 +1224,23 @@ function consensus() {
                 return wait_for_proposals(true)
 
             // execution to here means we are on the consensus ledger
+            
+            // set up our voting counters
+            var votes = {
+                con: {},
+                inp: {},
+                out: {},
+                sta: {},
+                time: {}
+            }
 
             for (var i in proposals) {
                 var p = proposals[i]
 
-                //dbg('proposal ' + i, proposals[i])
-            
-                // todo: no real need for either of these, consider removing
-                inc(votes.lcl, p.lcl)
-                inc(votes.stage, p.stage)
+                // everyone votes on an arbitrary time, as long as its within the round time
+                // and not in the future
+                if (time > p.time && time - p.time < node.roundtime)  
+                    inc(votes.time, p.time)
 
                 for (var j in p.con)
                     inc(votes.con, p.con[j])
@@ -1357,11 +1354,22 @@ function consensus() {
                 }
             }
 
+            // time is voted on a simple sorted and majority basis, 
+            // there will always be disagreement
+            votes.time = JSON.parse(JSON.stringify(votes.time, get_all_keys(votes.time)))
+            largest_vote = 0
+            for (var i in votes.time) {
+                if (votes.time[i] > largest_vote) {
+                    largest_vote = votes.time[i]
+                    proposal.time = i
+                }
+            } 
+
+            // we always vote for our current lcl regardless of what other peers are saying
+            // if there's a fork condition we will either request history and state from 
+            // our peers or we will halt depending on level of consensus on the sides of the fork
             proposal.lcl = ram.consensus.lcl
 
-
-            // todo: the way lcl and state are negotitated using a simple threshold is probably wrong
-            // and will potentially lead to forks, should be reconsidered at a later date, e.g. prod
 
             var peer_msg = sign_peer_message(proposal)
             var proposal_msg_unsigned = peer_msg.unsigned
@@ -1370,157 +1378,8 @@ function consensus() {
             broadcast_to_peers(peer_msg.signed) 
 
 
-            if (ram.consensus.stage == 3) {
-                // we've reached the end of a consensus round
-
-                // so we need to apply inputs, collect outputs
-                // and clear buffers, and assign unused inputs to next round
-
-                // here ledger is the encoded string version of the closed ledger,
-                // proposal is the object form
-                
-
-                // prune off timestamp, pubkey, signature
-                delete proposal.pubkey
-                delete proposal.timestamp
-                delete proposal.sig
-                delete proposal.stage
-
-                var ledger = JSON.stringify(proposal, get_all_keys(proposal))
-
-                // lcl = last closed ledger
-                var lcl = SHA512H( ledger, 'LEDGER' )
-            
-                dbg('last closed ledger: ' + lcl)
-
-                // write the new lcl to history
-                var fd = fs.openSync( node.dir + '/hist/' + lcl, 'w' )
-                fs.writeSync(fd, ledger)
-                fs.closeSync(fd)
-
-                ram.consensus.lcl = lcl
-
-                // first send out any relevant output from the previous consensus round and execution
-                for (var i in proposal.out) {
-                    var hash = proposal.out[i]
-
-                    if (!ram.consensus.possible_output_dict[hash]) {
-                        warn('output required ' + hash + ' but wasn\'t in our possible output dict, this will potentially cause desync')
-                        continue // todo: consider fatal
-                    }
-
-                    for (var user in ram.consensus.possible_output_dict[hash]) {
-                        // there'll be just the one key
-
-                        var output = ram.consensus.possible_output_dict[hash][user]
-                        try {
-                            output = Buffer.from(''+output, 'hex').toString()
-                        } catch (e) {
-                            warn('output represented by hash ' + hash + ' for user ' + user + ' was not valid hex') 
-                            continue
-                        } 
-
-                        // check if the user is in our locally connected users
-                        for (var j in ram.public_connections_authed) {
-                            if (j.replace(/^.*;/, '') == user) {
-                                // this is our locally connected user, send his contract output to him
-                                ram.public_connections_authed[j].send(output)
-                                break
-                            }
-                        }
-                    }
-                }
-
-                // now we can safely clear our output dictionary
-                ram.consensus.possible_output_dict = {}
-
-                // check our state against the winning / canonical state
-                var curr = SHA512H(JSON.stringify(ram.state.hash, get_all_keys(ram.state.hash)), 'STATE')
-                var canonical = ram.consensus.possible_state_dict[proposal.sta]
-                if (!canonical) {
-                    warn('could not find consensus state in our possible state dict, this will cause desync')
-                } else if (canonical.curr != curr) {
-
-                    // first check to ensure our previous state is the same as the canonical previous state
-                    var prev = SHA512H(JSON.stringify(ram.state.prev_hash, get_all_keys(ram.state.prev_hash)), 'STATE')
-                    if (canonical.prev == prev) {
-                       
-                        // file system isn't in sync, but our previous state is, so do a roll back to that 
-                        warn('our file state differed from consensus, rolling back and patching now')
-                        rollback_state() 
-
-                        apply_state_patch(node.dir + '/state' , canonical.patch)
-
-                        // now we should have the canonical state, but let's double check if that's true
-                        // if we don't we'll need to request the state
-
-
-                        var hash = generate_directory_state(node.dir + '/state', true, generate_file_hash, prune_state_dir)
-                        
-                        curr = SHA512H(JSON.stringify(hash, get_all_keys(hash)), 'STATE')
-
-                        if (canonical.curr != curr) {
-                            warn('even after rolling back and applying state patches the file system is not on consensus, ' +
-                                'requesting state from peer')
-
-                            request_state_from_peer()
-                            return wait_for_proposals(true)
-                        }
-                    } else {
-
-                        // the canonical previous state is not the same as our previous state, we'll need to do a
-                        // state request from our peers before we can continue
-
-                        request_state_from_peer()
-
-                        return wait_for_proposals(true)
-                    }
-                }
-
-                // and our state change dict
-                ram.consensus.possible_state_dict = {}
-
-                // structure we need to provide to the contract binary run routine:
-                // { user_pub_key: [ stream of raw input or empty if no input is available ] }
-                // every connected user must have an entry
-
-                //dbg("closed ledger", proposal)
-
-                var concrete_inputs = {}
-
-                // we need to provide a dummy entry for every connected user
-                // this is so the contract can push data to the user
-                for (var i in proposal.con)
-                    concrete_inputs[proposal.con[i]] = []
-
-                // now process any actual inputs
-                for (var i in proposal.inp) {
-                    var hash = proposal.inp[i]
-                    if (!ram.consensus.possible_input_dict[hash]) {
-                        warn('input required ' + hash + ' but it wasn\'t in our possible input dict, this will cause desync')
-                        continue //todo: consider making this fatal
-                    }
-
-                    for (var j in ram.consensus.possible_input_dict[hash]) {
-                        // there'll be just the one key
-                        var inputshex = ram.consensus.possible_input_dict[hash][j]
-                        var inputsbuf = []
-                        for (var k in inputshex)
-                            inputsbuf[k] = Buffer.from(inputshex[k], 'hex')
-                        
-                        concrete_inputs[j] = inputsbuf
-                        break
-                    }
-                }
-
-                // clear possible input dictionary since we've materalised the actual inputs
-                ram.consensus.possible_input_dict = {}
-
-                //todo: check contract state against consensus
-
-                run_contract_binary(concrete_inputs)
-
-        }
+            if (ram.consensus.stage == 3) 
+                apply_ledger(proposal)
             
     }
 
@@ -1532,6 +1391,159 @@ function consensus() {
     ram.consensus.stage = (ram.consensus.stage + 1) % 4  
 }
 
+// called with a stage 3 proposal at the end of a consensus round
+function apply_ledger(proposal) {
+
+    // we've reached the end of a consensus round
+
+    // so we need to apply inputs, collect outputs
+    // and clear buffers, and assign unused inputs to next round
+
+    // here ledger is the encoded string version of the closed ledger,
+    // proposal is the object form
+    
+
+    // prune off timestamp, pubkey, signature
+    delete proposal.pubkey
+    delete proposal.timestamp
+    delete proposal.sig
+    delete proposal.stage
+
+    var ledger = JSON.stringify(proposal, get_all_keys(proposal))
+
+    // lcl = last closed ledger
+    var lcl = SHA512H( ledger, 'LEDGER' )
+
+    dbg('last closed ledger: ' + lcl)
+
+    // write the new lcl to history
+    var fd = fs.openSync( node.dir + '/hist/' + lcl, 'w' )
+    fs.writeSync(fd, ledger)
+    fs.closeSync(fd)
+
+    ram.consensus.lcl = lcl
+
+    // first send out any relevant output from the previous consensus round and execution
+    for (var i in proposal.out) {
+        var hash = proposal.out[i]
+
+        if (!ram.consensus.possible_output_dict[hash]) {
+            warn('output required ' + hash + ' but wasn\'t in our possible output dict, this will potentially cause desync')
+            continue // todo: consider fatal
+        }
+
+        for (var user in ram.consensus.possible_output_dict[hash]) {
+            // there'll be just the one key
+
+            var output = ram.consensus.possible_output_dict[hash][user]
+            try {
+                output = Buffer.from(''+output, 'hex').toString()
+            } catch (e) {
+                warn('output represented by hash ' + hash + ' for user ' + user + ' was not valid hex') 
+                continue
+            } 
+
+            // check if the user is in our locally connected users
+            for (var j in ram.public_connections_authed) {
+                if (j.replace(/^.*;/, '') == user) {
+                    // this is our locally connected user, send his contract output to him
+                    ram.public_connections_authed[j].send(output)
+                    break
+                }
+            }
+        }
+    }
+
+    // now we can safely clear our output dictionary
+    ram.consensus.possible_output_dict = {}
+
+    // check our state against the winning / canonical state
+    var curr = SHA512H(JSON.stringify(ram.state.hash, get_all_keys(ram.state.hash)), 'STATE')
+    var canonical = ram.consensus.possible_state_dict[proposal.sta]
+    if (!canonical) {
+        warn('could not find consensus state in our possible state dict, this will cause desync')
+    } else if (canonical.curr != curr) {
+
+        // first check to ensure our previous state is the same as the canonical previous state
+        var prev = SHA512H(JSON.stringify(ram.state.prev_hash, get_all_keys(ram.state.prev_hash)), 'STATE')
+        if (canonical.prev == prev) {
+           
+            // file system isn't in sync, but our previous state is, so do a roll back to that 
+            warn('our file state differed from consensus, rolling back and patching now')
+            rollback_state() 
+
+            apply_state_patch(node.dir + '/state' , canonical.patch)
+
+            // now we should have the canonical state, but let's double check if that's true
+            // if we don't we'll need to request the state
+
+            var hash = generate_directory_state(node.dir + '/state', true, generate_file_hash, prune_state_dir)
+            
+            curr = SHA512H(JSON.stringify(hash, get_all_keys(hash)), 'STATE')
+
+            if (canonical.curr != curr) {
+                warn('even after rolling back and applying state patches the file system is not on consensus, ' +
+                    'requesting state from peer')
+
+                request_state_from_peer()
+                return wait_for_proposals(true)
+            }
+        } else {
+
+            // the canonical previous state is not the same as our previous state, we'll need to do a
+            // state request from our peers before we can continue
+
+            request_state_from_peer()
+
+            return wait_for_proposals(true)
+        }
+    }
+
+    // and our state change dict
+    ram.consensus.possible_state_dict = {}
+
+    // structure we need to provide to the contract binary run routine:
+    // { user_pub_key: [ stream of raw input or empty if no input is available ] }
+    // every connected user must have an entry
+
+    //dbg("closed ledger", proposal)
+
+    var concrete_inputs = {}
+
+    // we need to provide a dummy entry for every connected user
+    // this is so the contract can push data to the user
+    for (var i in proposal.con)
+        concrete_inputs[proposal.con[i]] = []
+
+    // now process any actual inputs
+    for (var i in proposal.inp) {
+        var hash = proposal.inp[i]
+        if (!ram.consensus.possible_input_dict[hash]) {
+            warn('input required ' + hash + ' but it wasn\'t in our possible input dict, this will cause desync')
+            continue //todo: consider making this fatal
+        }
+
+        for (var j in ram.consensus.possible_input_dict[hash]) {
+            // there'll be just the one key
+            var inputshex = ram.consensus.possible_input_dict[hash][j]
+            var inputsbuf = []
+            for (var k in inputshex)
+                inputsbuf[k] = Buffer.from(inputshex[k], 'hex')
+            
+            concrete_inputs[j] = inputsbuf
+            break
+        }
+    }
+
+    // clear possible input dictionary since we've materalised the actual inputs
+    ram.consensus.possible_input_dict = {}
+
+    //todo: check contract state against consensus
+
+    run_contract_binary(concrete_inputs)
+
+}
+
 function run_contract_binary(inputs) {
 
     var childpipesflat  = []     // pipes.childread, pipes.childwrite ]
@@ -1539,6 +1551,18 @@ function run_contract_binary(inputs) {
 
     // pubkeyhex -> {parentwrite:, parentread:} 
     var outputpipes = {}
+
+    /**
+        anatomy of a hp fdlist
+
+        {
+            type: 'binexec',        // these entries must come first
+            hotpocket: <version>,
+            timestamp: 
+        }
+
+    **/
+
 
     var fdlist = "HOTPOCKET " + HP_VERSION + "\n"
 
