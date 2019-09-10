@@ -650,14 +650,37 @@ function on_public_connection(ws) {
 
 
 function prune_cache_watchdog() {
-
     var time = Math.floor(Date.now()/1000)
     for (var i in ram.recent_peer_msghash)
         if (ram.recent_peer_msghash[i] < time - 60)
             delete ram.recent_peer_msghash[i]
 
-    setTimeout(prune_cache_watchdog, 60)
+    setTimeout(prune_cache_watchdog, 1000)
+}
 
+function prune_history_watchdog() {
+
+    // grab the history director's mtimes
+    var modification_times = generate_directory_state( node.dir + '/hist', 
+                                true, get_modified_time )
+
+    // flip the map
+    modification_times = swap_keys_for_values(modification_times)
+
+    var mtime_sorted = Object.keys(modification_times).sort().reverse()
+
+    // todo: don't delete history newer than a certain time    
+
+    var history_to_delete = mtime_sorted.length - 100 // todo: this is a magic number (size of history to keep)
+    if (history_to_delete > 0) 
+        for (var i = 0; i < history_to_delete; ++i)
+            try {
+                fs.unlinkSync(modification_times[mtime_sorted[i]])
+            } catch (e) {
+                warn('tried to delete old history ' + modification_times[mtime_sorted[i]] + ' but couldn\'t')
+            }
+    
+    setTimeout(prune_history_watchdog, 15000)
 }
 
 
@@ -1396,9 +1419,9 @@ function consensus() {
             broadcast_to_peers(peer_msg.signed) 
 
 
-            if (ram.consensus.stage == 3) 
+            if (ram.consensus.stage == 3) {
                 apply_ledger(proposal)
-            
+            }            
     }
 
     // after a novel proposal we will just busy wait for proposals
@@ -1463,6 +1486,8 @@ function apply_ledger(proposal) {
 
             // check if the user is in our locally connected users
             for (var j in ram.public_connections_authed) {
+                console.log(j)
+                console.log(user)
                 if (j.replace(/^.*;/, '') == user) {
                     // this is our locally connected user, send his contract output to him
                     ram.public_connections_authed[j].send(output)
@@ -1625,7 +1650,7 @@ function run_contract_binary() {
             return
         }
 
-        dbg('contract output', Buffer.from(output).toString())
+        dbg('contract output: ' + Buffer.from(output).toString())
 
         // execution to here means the contract has finished execution
         handle_state_after_execution()
@@ -1639,7 +1664,8 @@ function run_contract_binary() {
             var out = Buffer.from(pipe.getfdbytes(ram.execution.pipe.user[user]))
             if (out.length > 0) {
                 outputs[user] =  [sodium.to_hex(out)]
-                dbg("contract produced " + out.length + " bytes of output on fd " + ram.execution.pipe.user[user])
+                dbg("contract produced " + out.length + " bytes of output on fd " +
+                     ram.execution.pipe.user[user])
             }
 
         }
@@ -1722,8 +1748,6 @@ function run_contract_binary() {
         fdlist.npl = [ pipes.childread, pipes.childwrite ]
 
         ram.execution.pipe.npl = [ pipes.parentread, pipes.parentwrite ]
-        
-        dbg('npl pipes', pipes)
     }
 
     for (var user in inputs) {
@@ -1751,7 +1775,6 @@ function run_contract_binary() {
     ram.execution.pipe.close = parentpipesflat
     
     //sort keys and remove whitespace
-    dbg('fdlist', fdlist)
     fdlist = JSON.stringify(fdlist, get_all_keys(fdlist), 1)
 
 
@@ -2063,6 +2086,9 @@ function main() {
 
     // set up ram structure pruning/gc
     prune_cache_watchdog()
+
+    // history can get large quickly!
+    prune_history_watchdog()
 
     // do consensus rounds!
     ram.consensus.stage = 0
