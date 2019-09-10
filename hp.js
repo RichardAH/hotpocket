@@ -729,6 +729,10 @@ function on_peer_connection(ws) {
             ram.consensus.proposals[msghash] = msg
             // broadcast it to our peers
             broadcast_to_peers(message)
+        } else if (msg.type == 'npl' && contains_keys(msg, 'npl', 'lcl', 'timestamp')) {
+            // node party line message
+            ram.npl.push(msg)
+            broadcast_to_peers(message)
         } else if (msg.type == 'sta_req' && contains_keys(msg, 'hash')) {
 
             // this message requests new state by providing the state the node currrently has
@@ -1542,29 +1546,124 @@ function apply_ledger(proposal) {
     // clear possible input dictionary since we've materalised the actual inputs
     ram.consensus.possible_input_dict = {}
 
-    //todo: check contract state against consensus
-    run_contract_binary(concrete_inputs, proposal)
+    ram.execution.pid = 0 // this will force a new execution, once this is > 0 func is re-entrant
+    ram.execution.inputs = concrete_inputs
+    ram.execution.ledger = proposal
+
+    run_contract_binary()
 
 }
 
-function run_contract_binary(inputs, proposal) {
+// watches the npl pipe connected to an executing contract
+// and transmits/retrieves the messages into/from the appropriate websocket connection/s
+function process_npl_messages() {
+
+    // first handle outgoing messages
+    var buf = Buffer.from(pipe.getfdbytes(ram.execution.pipe.npl[0]))
+    if (buf.length > 0) {
+        // create and sign a message
+        var npl_datagram = {
+            type: 'npl',
+            data: sodium.to_hex(buf),
+            timestamp: Math.floor(Date.now()/1000),
+            lcl: ram.execution.ledger.lcl
+        }
+        var signed = sign_peer_message(npl_datagram).signed
+        
+        // send to every peer
+        for (var peer in ram.peer_connections) 
+            ram.peer_connections[peer].send(signed)
+    }
+
+    // now empty the npl array into the write pipe
+    var incoming = ram.npl
+    ram.npl = {}
+
+    for (var i in incoming) {
+        var msg = incoming[i]
+        if (msg.lcl != ram.execution.ledger.lcl) {
+            warn('we had an npl message but it was for the wrong lcl, discarding')
+            continue
+        }
+        var buf = Buffer.from(msg.data, 'hex')
+        var header = Buffer.from('Length: ' + buf.length + '\nPubkey: ' + msg.pubkey + '\n\n')
+        // write into pipe
+        fs.writeSync(ram.execution.pipe.npl[1], Buffer.concat([header, buf])) 
+    }
+
+}
+
+
+/**
+    runs the contract binary against a proposal
+    this function is re-entrant, and called until execution has finished
+**/
+function run_contract_binary() {
+
+    var inputs = ram.execution.inputs
+    var proposal = ram.execution.ledger
+    var pid = ram.execution.pid
+
+    // if the contract is already running we need to check its progress
+    if (pid) {
+
+        var output = pipe.rawforkexecclose([], [], bin, fdlist, node.dir, ram.execution.pid)
+
+        // if still executing, process any npl messages then return
+        if (typeof(output) == 'number') { 
+            process_npl_messages()
+            return
+        }
+
+        // execution to here means the contract has finished execution
+        handle_state_after_execution()
+
+        // collect outptuts
+        // every connection has an entry in the inputs obj even if its []
+        var outputs = {}
+        for (var user in ram.execution.pipe.user) {
+
+            //console.log(Buffer.from(pipe.getfdbytes(outputpipes[user])).toString())
+            var out = Buffer.from(pipe.getfdbytes(ram.execution.pipe.user[user]))
+            if (out.length > 0) {
+                outputs[user] =  [sodium.to_hex(out)]
+                dbg("contract produced " + out.length + " bytes of output on fd " + ram.execution.pipe.user[user])
+            }
+        }
+
+        // close all the pipes we're finished with
+        for (var i in ram.execution.pipe.close) 
+            fs.closeSync(ram.execution.pipe.close[i])
+        
+
+        // these will be proposed in the next novel proposal (stage 0 proposal)
+        ram.consensus.local_output_dict = outputs
+
+        // we've finished execution
+        ram.execution.pid = 0
+        ram.execution.pipe.user = {}
+        ram.execution.pipe.close = []
+        ram.execution.npl = []
+
+        return
+    }
+
+    ram.execution.pipe.user = {}
+    ram.execution.pipe.npl = []
+    ram.execution.pipe.close = []
 
     var childpipesflat  = []     // pipes.childread, pipes.childwrite ]
     var parentpipesflat = []    // pipes.parentread, pipes.parentwrite ]
 
-    // pubkeyhex -> {parentwrite:, parentread:} 
-    var outputpipes = {}
-
     /**
         anatomy of a hp fdlist
-        note the JSON stringify level must be 1 with whitespace removed, for ease of parsing
-        it also must be key sorted, again to make parsing easy
         {
             hotpocket: <version>,
             type: 'binexec', 
             mver: 1,    
             time: <utc timestamp>,      // nodes can't use their own time or it will be non deterministic
             pubkey: <public key hex>,  // this node's public key
+            unl: [<pubkey hex>],
             user: {
                 <public key hex>: [<fd for reading from this user>, <fd for writing to this user>], ...
             },
@@ -1584,8 +1683,35 @@ function run_contract_binary(inputs, proposal) {
         mver: 1, // this is the message version type    
         time: proposal.time,
         pubkey: node.pubkeyhex,
-        ncc: {},
-        user: {}
+        unl: [],
+        npl: [], // node to node party line
+        user: {},
+        lcl: proposal.lcl
+    }
+
+    // add the UNL
+    for (var i in node.unl)
+        fdlist.unl.push(node.unl[i].hex)
+    
+    // create node to node party line
+    // messages coming in on this line are of the following format
+    // Length: <number of bytes>\n
+    // Sender: <pubkeyhex of sender>\n\n
+    // <binary data>
+    // messages going out need no header, just write to the pipe
+    {
+        // create pipes for node to node communication
+        var pipes = pipe.PipeDuplex()
+
+        childpipesflat.push(pipes.childread)
+        childpipesflat.push(pipes.childwrite)
+        parentpipesflat.push(pipes.parentread)
+        parentpipesflat.push(pipes.parentwrite)
+        
+        fdlist.npl = [ pipes.childread, pipes.childwrite ]
+
+        ram.execution.pipe.npl = [ pipes.parentread, pipes.parentwrite ]
+
     }
 
     for (var user in inputs) {
@@ -1597,63 +1723,33 @@ function run_contract_binary(inputs, proposal) {
         parentpipesflat.push(pipes.parentread)
         parentpipesflat.push(pipes.parentwrite)
 
-        outputpipes[user] = pipes.parentread
+        ram.execution.pipe.user[user] = pipes.parentread
 
         // queue up the input on each of the pipes
         for (var i in inputs[user]) 
             fs.writeSync(pipes.parentwrite, inputs[user][i])
 
+        // this is all that will ever be written to this pipe so we can close it
+        fs.closeSync(pipes.parentwrite)
+
         // compile a list of pipes and users to provide to the contract as stdin
         fdlist.user[user] = [ pipes.childread, pipes.childwrite ]
-
     }
     
+    ram.execution.pipe.close = parentpipesflat
+    
     //sort keys and remove whitespace
-    fdlist = JSON.stringify(fdlist, get_all_keys(fdlist), 1).replace(/\n */g, '\n')
+    fdlist = JSON.stringify(fdlist, get_all_keys(fdlist), 1)
 
-    console.log(fdlist)
+    dbg('fdlist', fdlist)
 
     var bin = [ node.binary ]
     for (var i in node.binargs) bin.push(node.binargs[i])
 
-
     prepare_state_before_execution()
 
+    ram.execution.pid = pipe.rawforkexecclose(childpipesflat, parentpipesflat, bin, fdlist, node.dir, 0)
 
-    var stdout = pipe.rawforkexecclose(childpipesflat, parentpipesflat, bin, fdlist, node.dir)
-
-    //dbg('contract stdout', stdout)
-
-
-    handle_state_after_execution()
-
-
-    // collect outptuts
-    // every connection has an entry in the inputs obj even if its []
-    var outputs = {}
-    for (var user in outputpipes) {
-
-        //console.log(Buffer.from(pipe.getfdbytes(outputpipes[user])).toString())
-        var out = Buffer.from(pipe.getfdbytes(outputpipes[user]))
-        if (out.length > 0) {
-            outputs[user] =  [sodium.to_hex(out)]
-            dbg("contract produced " + out.length + " bytes of output on fd " + outputpipes[user])
-        }
-    }
-
-    // close all the pipes we're finished with
-    for (var i in parentpipesflat) 
-        fs.closeSync(parentpipesflat[i])
-    
-
-    // attempt to close child pipes too
-    for (var i in childpipesflat)
-        try {
-         fs.closeSync(childpipesflat[i])
-        } catch(e) {}
-
-    // these will be proposed in the next novel proposal (stage 0 proposal)
-    ram.consensus.local_output_dict = outputs
 }
 
 function request_state_from_peer() {
@@ -1851,8 +1947,22 @@ function handle_state_after_execution() {
 
 function init_ram() {
 
+    // this structure holds execution data for contract,
+    // when pid is set > 0 the contract is still executing
+    // and no consensus round should be performed
+    ram.execution = {
+        pid: 0,
+        ledger: false,
+        inputs: false,
+        pipe: {
+            user: {},   // pubkeyhex => fdin
+            npl: [],   // [fdin, fdout] ** partyline for nodes to talk to eachother during execution 
+            close: [] // fds that need to be closed after execution completes
+        }
+    }
 
-
+    // this will hold pending npl messages from peers 
+    ram.npl = []
 
     // IP:PORT -> ws for all peers
     ram.peer_connections = {}
@@ -1918,7 +2028,6 @@ function init_ram() {
     // this variable contains the lcl of the last ledger requested from a peer
     ram.consensus.last_history_request = false
 
-
 }
 
 // hotpocket controller entry point
@@ -1944,9 +2053,15 @@ function main() {
 
     // do consensus rounds!
     ram.consensus.stage = 0
-    var consensus_round_timer = ()=>{ 
-            consensus()
-            setTimeout(consensus_round_timer, ram.consensus.nextsleep) 
+    var consensus_round_timer = ()=>{
+            if (ram.execution.pid) {
+                // when the contract is in execution we will busy wait for it
+                run_contract_binary()
+                setTimeout(consensus_round_timer, 1) 
+            } else { 
+                consensus()
+                setTimeout(consensus_round_timer, ram.consensus.nextsleep) 
+            }
     }
     consensus_round_timer()
 
