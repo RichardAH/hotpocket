@@ -1606,14 +1606,15 @@ function run_contract_binary() {
 
     // if the contract is already running we need to check its progress
     if (pid) {
-
-        var output = pipe.rawforkexecclose([], [], bin, fdlist, node.dir, ram.execution.pid)
+        var output  = pipe.rawforkexecclose([], [], [], "", node.dir, ram.execution.pid)
 
         // if still executing, process any npl messages then return
         if (typeof(output) == 'number') { 
             process_npl_messages()
             return
         }
+
+        //dbg('output buf', Buffer.from(output).toString())
 
         // execution to here means the contract has finished execution
         handle_state_after_execution()
@@ -1629,12 +1630,14 @@ function run_contract_binary() {
                 outputs[user] =  [sodium.to_hex(out)]
                 dbg("contract produced " + out.length + " bytes of output on fd " + ram.execution.pipe.user[user])
             }
+
         }
 
         // close all the pipes we're finished with
         for (var i in ram.execution.pipe.close) 
-            fs.closeSync(ram.execution.pipe.close[i])
-        
+            try {
+                fs.closeSync(ram.execution.pipe.close[i])
+            } catch (e) {}
 
         // these will be proposed in the next novel proposal (stage 0 proposal)
         ram.consensus.local_output_dict = outputs
@@ -1711,7 +1714,8 @@ function run_contract_binary() {
         fdlist.npl = [ pipes.childread, pipes.childwrite ]
 
         ram.execution.pipe.npl = [ pipes.parentread, pipes.parentwrite ]
-
+        
+        dbg('npl pipes', pipes)
     }
 
     for (var user in inputs) {
@@ -1739,9 +1743,9 @@ function run_contract_binary() {
     ram.execution.pipe.close = parentpipesflat
     
     //sort keys and remove whitespace
+    dbg('fdlist', fdlist)
     fdlist = JSON.stringify(fdlist, get_all_keys(fdlist), 1)
 
-    dbg('fdlist', fdlist)
 
     var bin = [ node.binary ]
     for (var i in node.binargs) bin.push(node.binargs[i])
@@ -2054,8 +2058,10 @@ function main() {
     // do consensus rounds!
     ram.consensus.stage = 0
     var consensus_round_timer = ()=>{
+            
             if (ram.execution.pid) {
                 // when the contract is in execution we will busy wait for it
+                console.log('waiting on pid = ' + ram.execution.pid)
                 run_contract_binary()
                 setTimeout(consensus_round_timer, 1) 
             } else { 
