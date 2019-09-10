@@ -277,6 +277,7 @@ function load_contract() {
 
     // first check all the directories exist
     if (!fs.existsSync(node.dir)) die('contract directory ' + node.dir + ' not found')
+    
     if (!fs.existsSync(node.dir + '/bin')) die('contract binary directory ' + node.dir + '/bin not found')
     if (!fs.existsSync(node.dir + '/cfg')) die('contract config directory ' + node.dir + '/cfg not found')
     if (!fs.existsSync(node.dir + '/state')) die('contract state directory ' + node.dir + '/state not found')
@@ -320,7 +321,11 @@ function load_contract() {
 
     // check the binary exists and executes
     if (!config.binary) die('contract binary must be specified in the config file e.g. { ..., "binary": "bin/contract" }')
-    if (!fs.existsSync(node.dir + '/' + config.binary)) die('contract binary not found at ' + node.dir + '/' + config.binary)
+    
+    if ( !(config.binary.match(/^\//) && fs.existsSync(config.binary)) &&
+         !fs.existsSync(node.dir + '/' + config.binary)
+       ) die('contract binary not found at ' + node.dir + '/' + config.binary)
+   
     node.binary = config.binary
 
     // check if bin args are specified
@@ -1616,6 +1621,8 @@ function run_contract_binary(inputs, proposal) {
 
 
     var stdout = pipe.rawforkexecclose(childpipesflat, parentpipesflat, bin, fdlist, node.dir)
+
+    //dbg('contract stdout', stdout)
 
 
     handle_state_after_execution()
