@@ -519,6 +519,13 @@ function peer_connection_watchdog() {
     setTimeout(peer_connection_watchdog, node.roundtime*4)
 }
 
+function npl_watchdog() {
+    if (ram.execution.pid > 0) { 
+        process_npl_messages()
+        setTimeout(npl_watchdog, 1)
+    }
+}
+
 function on_peer_close(ws) {
     for (var i in ram.peer_connections)
         if (ram.peer_connections[i] == ws) {
@@ -729,7 +736,7 @@ function on_peer_connection(ws) {
             ram.consensus.proposals[msghash] = msg
             // broadcast it to our peers
             broadcast_to_peers(message)
-        } else if (msg.type == 'npl' && contains_keys(msg, 'npl', 'lcl', 'timestamp')) {
+        } else if (msg.type == 'npl' && contains_keys(msg, 'data', 'lcl', 'timestamp')) {
             // node party line message
             ram.npl.push(msg)
             broadcast_to_peers(message)
@@ -923,7 +930,9 @@ function on_peer_connection(ws) {
 
             // done!!!
 
-        } else warn('received invalid message from peer') 
+        } else {
+            warn('received invalid message from peer ' + JSON.stringify(msg)) 
+        }
 
     })
 }
@@ -1558,7 +1567,26 @@ function apply_ledger(proposal) {
 // and transmits/retrieves the messages into/from the appropriate websocket connection/s
 function process_npl_messages() {
 
-    // first handle outgoing messages
+    // process incoming messages first
+    var incoming = ram.npl
+    ram.npl = []
+
+    for (var i in incoming) {
+        var msg = incoming[i]
+        if (msg.lcl != ram.execution.ledger.lcl) {
+            warn('we had an npl message but it was for the wrong lcl, discarding')
+            warn(msg.lcl + ' =/= ' + ram.execution.ledger.lcl)
+            continue
+        }
+
+        var buf = Buffer.from(msg.data, 'hex')
+        var header = Buffer.from('Length: ' + buf.length + '\nPubkey: ' + msg.pubkey + '\n\n')
+        // write into pipe
+        fs.writeSync(ram.execution.pipe.npl[1], Buffer.concat([header, buf])) 
+        dbg('npl data', buf.toString())
+    }
+
+    // handle outgoing messages
     var buf = Buffer.from(pipe.getfdbytes(ram.execution.pipe.npl[0]))
     if (buf.length > 0) {
         // create and sign a message
@@ -1573,22 +1601,6 @@ function process_npl_messages() {
         // send to every peer
         for (var peer in ram.peer_connections) 
             ram.peer_connections[peer].send(signed)
-    }
-
-    // now empty the npl array into the write pipe
-    var incoming = ram.npl
-    ram.npl = {}
-
-    for (var i in incoming) {
-        var msg = incoming[i]
-        if (msg.lcl != ram.execution.ledger.lcl) {
-            warn('we had an npl message but it was for the wrong lcl, discarding')
-            continue
-        }
-        var buf = Buffer.from(msg.data, 'hex')
-        var header = Buffer.from('Length: ' + buf.length + '\nPubkey: ' + msg.pubkey + '\n\n')
-        // write into pipe
-        fs.writeSync(ram.execution.pipe.npl[1], Buffer.concat([header, buf])) 
     }
 
 }
@@ -1610,11 +1622,10 @@ function run_contract_binary() {
 
         // if still executing, process any npl messages then return
         if (typeof(output) == 'number') { 
-            process_npl_messages()
             return
         }
 
-        //dbg('output buf', Buffer.from(output).toString())
+        dbg('contract output', Buffer.from(output).toString())
 
         // execution to here means the contract has finished execution
         handle_state_after_execution()
@@ -1644,9 +1655,6 @@ function run_contract_binary() {
 
         // we've finished execution
         ram.execution.pid = 0
-        ram.execution.pipe.user = {}
-        ram.execution.pipe.close = []
-        ram.execution.npl = []
 
         return
     }
@@ -1753,7 +1761,8 @@ function run_contract_binary() {
     prepare_state_before_execution()
 
     ram.execution.pid = pipe.rawforkexecclose(childpipesflat, parentpipesflat, bin, fdlist, node.dir, 0)
-
+    
+    npl_watchdog()
 }
 
 function request_state_from_peer() {
@@ -2061,9 +2070,9 @@ function main() {
             
             if (ram.execution.pid) {
                 // when the contract is in execution we will busy wait for it
-                console.log('waiting on pid = ' + ram.execution.pid)
+                //dbg('waiting on pid = ' + ram.execution.pid)
                 run_contract_binary()
-                setTimeout(consensus_round_timer, 1) 
+                setTimeout(consensus_round_timer, 10) 
             } else { 
                 consensus()
                 setTimeout(consensus_round_timer, ram.consensus.nextsleep) 
