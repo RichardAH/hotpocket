@@ -1231,6 +1231,8 @@ function consensus() {
                 patch: ram.state.patch
             }
 
+            ram.consensus.novel_proposal_time = time
+
             broadcast_to_peers(sign_peer_message(proposal).signed)
 
             break
@@ -1239,7 +1241,9 @@ function consensus() {
         case 1:
         case 2:
         case 3:
-    
+   
+
+ 
             var proposals = ram.consensus.proposals
             ram.consensus.proposals = {}
 
@@ -1261,8 +1265,12 @@ function consensus() {
                     delete proposals[i]
                 }
 
-            if (check_lcl_votes(lcl_votes))
-                return wait_for_proposals(true)
+            if (check_lcl_votes(lcl_votes)) {
+                for (var i in proposals)
+                    ram.consensus.proposals[i] = proposals[i] 
+
+                return wait_for_proposals((time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000)))
+            }
 
             // execution to here means we are on the consensus ledger
             
@@ -1353,8 +1361,9 @@ function consensus() {
                 //warn('will not proceed until 80% of UNL peers are proposing -- have ' + total_votes + ' out of ' + total_possible_votes)
                 // copy proposals back into ram
                 for (var i in proposals)
-                    ram.consensus.proposals[i] = proposals[i] 
-                return wait_for_proposals(false) 
+                    ram.consensus.proposals[i] = proposals[i]
+ 
+                return wait_for_proposals((time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000))) 
             }
 
 
