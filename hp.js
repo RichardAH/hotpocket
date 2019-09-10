@@ -1043,7 +1043,7 @@ function swap_keys_for_values(dict) {
 
 function wait_for_proposals(reset) {
     if (reset) ram.consensus.stage = 0
-    ram.consensus.nextsleep = 1// (sodium.randombytes_buf(1)[0]/256)*1000// * node.roundtime 
+    ram.consensus.nextsleep =  (sodium.randombytes_buf(1)[0]/256)*200// * node.roundtime 
 }
 
 
@@ -1232,6 +1232,8 @@ function consensus() {
             }
 
             ram.consensus.novel_proposal_time = time
+
+            dbg('novel prop', proposal)
 
             broadcast_to_peers(sign_peer_message(proposal).signed)
 
