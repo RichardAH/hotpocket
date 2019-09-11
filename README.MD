@@ -36,7 +36,7 @@ Example
 }
 ```
 
-Your SC should read and parse this list from stdin and then read and write from the user's specific fd's according to your SC's desire or need to communicate with those users. Whenever there is an array of fds, the 0th entry is the input fd and the 1st entry is the output directory. So for example to talk to the user whose public key is `703a9da32528c2b270c0795987a13a37777776eb6ea8ac24fcb448ce1cce20af` above we would write output to FD 32. If we wanted to read any input they had sent us we would read from FD 33.
+Your SC should read and parse this list from stdin and then read and write from the user's specific fd's according to your SC's desire or need to communicate with those users. Whenever there is an array of fds, the 0th entry is the input fd and the 1st entry is the output FD. So for example to talk to the user whose public key is `703a9da32528c2b270c0795987a13a37777776eb6ea8ac24fcb448ce1cce20af` above we would write output to FD 32. If we wanted to read any input they had sent us we would read from FD 33.
 
 
 ## User Connections
