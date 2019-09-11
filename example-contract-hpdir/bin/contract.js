@@ -1,3 +1,6 @@
+process.on("uncaughtException", function(err){
+    console.log("Uncaught exception raised : " + err);
+});
 /**
     HpDir -- A Hot Pocket smart contract to provide directory services
              for other smart contracts

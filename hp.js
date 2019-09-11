@@ -1044,7 +1044,7 @@ function swap_keys_for_values(dict) {
 
 function wait_for_proposals(reset) {
     if (reset) ram.consensus.stage = 0
-    ram.consensus.nextsleep =  (sodium.randombytes_buf(1)[0]/256)*20// * node.roundtime 
+    ram.consensus.nextsleep =  (sodium.randombytes_buf(1)[0]/256)*200// * node.roundtime 
 }
 
 
@@ -1230,7 +1230,7 @@ function consensus() {
 
             ram.consensus.novel_proposal_time = time
             //proposal.sta = {}
-            /*
+            
             if (!ram.consensus.nprop) ram.consensus.nprop = {}
             var ts = proposal.timestamp
             delete proposal.timestamp
@@ -1238,9 +1238,9 @@ function consensus() {
             proposal.timestamp = ts
             if (!ram.consensus.nprop[h]) {
                 ram.consensus.nprop[h] = true                
-                //dbg('novel prop', proposal)
-            } else console.log('sent same proposal again')
-            */
+                dbg('novel prop', proposal)
+            } //else console.log('sent same proposal again')
+            
 
             proposal.time = time
 
@@ -1289,7 +1289,7 @@ function consensus() {
 
             // check if we're ahead of consensus
             if (winning_stage < ram.consensus.stage - 1) {
-                console.log('wait for proposals 3a --- ' + winning_stage)
+                //console.log('wait for proposals 3a --- ' + winning_stage)
                 //dbg('stage votes', stage_votes)
                 return wait_for_proposals(time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000))
             } else if (winning_stage > ram.consensus.stage - 1) {
@@ -1393,7 +1393,7 @@ function consensus() {
             if (total_votes / total_possible_votes < 0.8) {
                 //warn('will not proceed until 80% of UNL peers are proposing -- have ' + total_votes + ' out of ' + total_possible_votes)
                 // copy proposals back into ram
-                console.log('wait for proposals 5') 
+                //console.log('wait for proposals 5') 
                 return wait_for_proposals((time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000))) 
             }
 
@@ -1466,7 +1466,7 @@ function consensus() {
 
 
             if (ram.consensus.stage == 3) {
-                //dbg('lcl', proposal)
+                dbg('lcl', proposal)
                 apply_ledger(proposal)
             }            
     }
