@@ -756,9 +756,12 @@ function on_peer_connection(ws) {
         // check what sort of message it is
         // todo: ensure each peer can send only one proposal for each stage on each lcl!!! important!!!
         if (msg.type == 'proposal' && contains_keys(msg, 'con', 'inp', 'out', 'lcl', 'stage', 'timestamp', 'type')) {
-            ram.consensus.proposals[msghash] = msg
+            console.log('received proposal from peer')
+            //ram.consensus.proposals[msghash] = msg
+            ram.consensus.proposals[msg.pubkey] = msg
             // broadcast it to our peers
             broadcast_to_peers(message)
+
         } else if (msg.type == 'npl' && contains_keys(msg, 'data', 'lcl', 'timestamp')) {
             // node party line message
             ram.npl.push(msg)
@@ -1062,8 +1065,10 @@ function check_lcl_votes(lcl_votes) {
     for (var i in lcl_votes)
             total_votes += lcl_votes[i]
     
-    if (total_votes == 0)
+    if (total_votes == 0) {
+        warn('no votes')
         return true 
+    }
 
     if (total_votes < node.unl.length * 0.8) {
             if (ram.consensus.last_not_enough_peer_msg && 
@@ -1139,7 +1144,7 @@ function consensus() {
         sta: "",
         lcl: ram.consensus.lcl,
         stage: ram.consensus.stage,
-        time: time // this differs from the timestamp, it is 'consensus time'
+        time: 0//time // this differs from the timestamp, it is 'consensus time'
     }
 
 
@@ -1231,9 +1236,22 @@ function consensus() {
                 patch: ram.state.patch
             }
 
+            //proposal.sta = {}
+
             ram.consensus.novel_proposal_time = time
 
-            dbg('novel prop', proposal)
+            if (!ram.consensus.nprop) ram.consensus.nprop = {}
+            var ts = proposal.timestamp
+            delete proposal.timestamp
+            var h = SHA512H(JSON.stringify(proposal, get_all_keys(proposal)), 'NPROP')
+            proposal.timestamp = ts
+            if (!ram.consensus.nprop[h]) {
+                ram.consensus.nprop[h] = true                
+                dbg('novel prop', proposal)
+            } else console.log('sent same proposal again')
+
+
+            proposal.time = time
 
             broadcast_to_peers(sign_peer_message(proposal).signed)
 
@@ -1247,7 +1265,7 @@ function consensus() {
 
  
             var proposals = ram.consensus.proposals
-            ram.consensus.proposals = {}
+            //ram.consensus.proposals = {}
 
             
 
@@ -1257,21 +1275,43 @@ function consensus() {
             // history first and are not currently ready to vote
 
             lcl_votes = {}
-            for (var i in proposals)
+
+            stage_votes = {}
+
+            for (var i in proposals) {
+                if (proposals[i].lcl == ram.consensus.lcl)
+                    inc(stage_votes, proposals[i].stage)
+
                 if (time - proposals[i].timestamp < node.roundtime * 4 && 
                     proposals[i].stage == ram.consensus.stage - 1) {
                     inc(lcl_votes, proposals[i].lcl)
-                } else if (proposals[i].stage < ram.consensus.stage - 1) {
-                    console.log("deleting old proposals " + proposals[i].lcl + ".stage=" + 
-                                proposals[i].stage + " from " + proposals[i].pubkey)
-                    delete proposals[i]
                 }
+            }
+            var winning_stage = -1
+            var largestvote = 0
+            for (var i in stage_votes) {
+                if (stage_votes[i] > largestvote) {
+                    largestvote = stage_votes[i]
+                    winning_stage = i
+                }
+            }
+
+            // check if we're ahead of consensus
+            if (winning_stage < ram.consensus.stage - 1) {
+                console.log('wait for proposals 3a --- ' + winning_stage)
+                dbg('stage votes', stage_votes)
+                return wait_for_proposals(time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000))
+            } else if (winning_stage > ram.consensus.stage - 1) {
+                // we're behind consensus
+                console.log('wait for proposals 3b')
+                return wait_for_proposals(true)
+            }
+
 
             if (check_lcl_votes(lcl_votes)) {
-                for (var i in proposals)
-                    ram.consensus.proposals[i] = proposals[i] 
-
-                return wait_for_proposals((time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000)))
+                //dbg('consensus failure no lcl agreement, or simply no proposals')
+                console.log('wait for proposals 4')
+                return wait_for_proposals(time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000))
             }
 
             // execution to here means we are on the consensus ledger
@@ -1362,9 +1402,7 @@ function consensus() {
             if (total_votes / total_possible_votes < 0.8) {
                 //warn('will not proceed until 80% of UNL peers are proposing -- have ' + total_votes + ' out of ' + total_possible_votes)
                 // copy proposals back into ram
-                for (var i in proposals)
-                    ram.consensus.proposals[i] = proposals[i]
- 
+                console.log('wait for proposals 5') 
                 return wait_for_proposals((time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000))) 
             }
 
@@ -1423,6 +1461,12 @@ function consensus() {
             proposal.lcl = ram.consensus.lcl
 
 
+            //proposal.sta = ""
+
+            for (var i in proposals)
+                if (proposals[i].stage < ram.consensus.stage)
+                    delete proposals[i] 
+
             var peer_msg = sign_peer_message(proposal)
             var proposal_msg_unsigned = peer_msg.unsigned
 
@@ -1431,6 +1475,7 @@ function consensus() {
 
 
             if (ram.consensus.stage == 3) {
+                dbg('lcl', proposal)
                 apply_ledger(proposal)
             }            
     }
@@ -1524,6 +1569,10 @@ function apply_ledger(proposal) {
            
             // file system isn't in sync, but our previous state is, so do a roll back to that 
             warn('our file state differed from consensus, rolling back and patching now')
+            
+            dbg('canonical state', canonical)
+            dbg('our state', ram.consensus.state)
+
             rollback_state() 
 
             apply_state_patch(node.dir + '/state' , canonical.patch)
@@ -1540,6 +1589,8 @@ function apply_ledger(proposal) {
                     'requesting state from peer')
 
                 request_state_from_peer()
+
+                console.log('wait for proposals 1')
                 return wait_for_proposals(true)
             }
         } else {
@@ -1548,6 +1599,7 @@ function apply_ledger(proposal) {
             // state request from our peers before we can continue
 
             request_state_from_peer()
+            console.log('wait for proposals 2')
             return wait_for_proposals(true)
         }
     }
