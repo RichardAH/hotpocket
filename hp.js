@@ -756,9 +756,7 @@ function on_peer_connection(ws) {
         // check what sort of message it is
         // todo: ensure each peer can send only one proposal for each stage on each lcl!!! important!!!
         if (msg.type == 'proposal' && contains_keys(msg, 'con', 'inp', 'out', 'lcl', 'stage', 'timestamp', 'type')) {
-            console.log('received proposal from peer')
-            //ram.consensus.proposals[msghash] = msg
-            ram.consensus.proposals[msg.pubkey] = msg
+            ram.consensus.proposals[msg.pubkey + '-' + msg.stage] = msg
             // broadcast it to our peers
             broadcast_to_peers(message)
 
@@ -1046,7 +1044,7 @@ function swap_keys_for_values(dict) {
 
 function wait_for_proposals(reset) {
     if (reset) ram.consensus.stage = 0
-    ram.consensus.nextsleep =  (sodium.randombytes_buf(1)[0]/256)*200// * node.roundtime 
+    ram.consensus.nextsleep =  (sodium.randombytes_buf(1)[0]/256)*20// * node.roundtime 
 }
 
 
@@ -1152,10 +1150,9 @@ function consensus() {
 
         case 0: // in stage 0 we create a novel proposal and broadcast it
         {
-            
-            var pending_inputs = ram.local_pending_inputs
-            ram.local_pending_inputs = {}
 
+            // we store all input until such time as the inputs make their way into a closed ledger            
+            var pending_inputs = ram.local_pending_inputs
 
             // clear out the old stage 3 proposals and any previous proposals made by us
             // todo: check the state of these to ensure we're running consensus ledger
@@ -1187,11 +1184,6 @@ function consensus() {
                     for (var j in pending_inputs[i]) {
                         var user_input = pending_inputs[i][j]
                         proposal.inp[user].push(sodium.to_hex(user_input)) //push(user_input)
- 
-                        //todo: old inputs need to be stripped from this object when consensus round closes
-                        //any that didn't make it into the Nth round need to make it into N+1
-                        if (!ram.local_pending_inputs_old[i]) ram.local_pending_inputs_old[i] = []
-                        ram.local_pending_inputs_old[i].push(user_input)
                     }
                 }
             }
@@ -1236,10 +1228,9 @@ function consensus() {
                 patch: ram.state.patch
             }
 
-            //proposal.sta = {}
-
             ram.consensus.novel_proposal_time = time
-
+            //proposal.sta = {}
+            /*
             if (!ram.consensus.nprop) ram.consensus.nprop = {}
             var ts = proposal.timestamp
             delete proposal.timestamp
@@ -1247,9 +1238,9 @@ function consensus() {
             proposal.timestamp = ts
             if (!ram.consensus.nprop[h]) {
                 ram.consensus.nprop[h] = true                
-                dbg('novel prop', proposal)
+                //dbg('novel prop', proposal)
             } else console.log('sent same proposal again')
-
+            */
 
             proposal.time = time
 
@@ -1299,7 +1290,7 @@ function consensus() {
             // check if we're ahead of consensus
             if (winning_stage < ram.consensus.stage - 1) {
                 console.log('wait for proposals 3a --- ' + winning_stage)
-                dbg('stage votes', stage_votes)
+                //dbg('stage votes', stage_votes)
                 return wait_for_proposals(time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000))
             } else if (winning_stage > ram.consensus.stage - 1) {
                 // we're behind consensus
@@ -1475,7 +1466,7 @@ function consensus() {
 
 
             if (ram.consensus.stage == 3) {
-                dbg('lcl', proposal)
+                //dbg('lcl', proposal)
                 apply_ledger(proposal)
             }            
     }
@@ -1628,14 +1619,37 @@ function apply_ledger(proposal) {
             continue //todo: consider making this fatal
         }
 
-        for (var j in ram.consensus.possible_input_dict[hash]) {
+        for (var user in ram.consensus.possible_input_dict[hash]) {
             // there'll be just the one key
-            var inputshex = ram.consensus.possible_input_dict[hash][j]
-            var inputsbuf = []
-            for (var k in inputshex)
-                inputsbuf[k] = Buffer.from(inputshex[k], 'hex')
+            var inputshex = ram.consensus.possible_input_dict[hash][user]
             
-            concrete_inputs[j] = inputsbuf
+            var inputsbuf = []
+            for (var k in inputshex) {
+                inputsbuf[k] = Buffer.from(inputshex[k], 'hex')
+               
+                // todo: this hacky code assumes very small user inputs, 
+                // this should be revised for efficiency (following two for loops)
+                // remove entries from pending inputs that made their way into
+                // a closed ledger
+                var fulluser = ""
+                for (var fu in ram.local_pending_inputs)
+                    if (fu.replace(/^.*;/,'') == user) {
+                        fulluser = fu
+                        break
+                    }
+                for (var l in ram.local_pending_inputs[fulluser]) {
+                    if (sodium.to_hex(ram.local_pending_inputs[fulluser][l]) == 
+                        inputshex[k])
+                        delete ram.local_pending_inputs[fulluser][l]
+                }
+            }
+
+            // check if the pending input for this user contains any more data
+            if (ram.local_pending_inputs[user] &&
+                Object.keys(ram.local_pending_inputs[user]).length == 0)
+                delete ram.local_pending_inputs[user]
+            
+            concrete_inputs[user] = inputsbuf
             break
         }
     }
@@ -2074,12 +2088,8 @@ function init_ram() {
 
     // IP:PORT;pubkeyhex -> [ ordered list of input packets ]
     // these are any messages we've received from authed public connections
-    // that haven't yet been placed into a proposal
+    // that haven't yet been placed into a closed ledger
     ram.local_pending_inputs = {}
-
-    // as above however they have been placed into a proposal and are waiting for validation
-    ram.local_pending_inputs_old = {}
-
 
     // contains a dict comprising SHA512H -> time received
     ram.recent_peer_msghash = {}
