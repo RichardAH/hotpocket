@@ -46,7 +46,8 @@ Users connect via websocket to any HP node in your network (running your SC). Yo
 The node a user is connected to is responsible for maintaining the user's connection. That node is also responsible for collecting input from the user, and circulating that input into the consensus algorithm, and collecting outputs destined for that user (from the outcome of consensus) and routing those outputs to that user.
 
 When a user connects to a HP node it is sent a `public_challenge` message:
-```{
+```
+{
 hotpocket: 0.1,
 type: 'public_challenge',
 challenge: 'ef97b2286de21927d48cc54fcab401c3'
@@ -74,14 +75,14 @@ Now the challenge/response handshake is completed the user is dropped into a bin
 ## Node Party Line
 Two FDs are provided in the fdlist under the npl key. These access what's called the node party line. This is effectively a realtime communication channel shared by all nodes connected to your HP network. The purpose of this channel is to allow nodes to perform multisigning and other tasks that require each node to behave as an individual rather than a perfectly deterministic clone of every other node. So for example 4 nodes with 4 keys could all sign a message and convey to eachother their signatures over the node party line. Once all signatures are collected all 4 nodes can agree on an order and a canonical transaction with 4 signatures attached to it.
 
-To read messages from the NPL use the 0th FD. The format of messages on the 0th FD is borrowed from HTTP response header:
+To read messages from the NPL use the 0th FD. The format of messages on the 0th FD is similar to HTTP response header (except no \r):
 ```
 Length: 1031\n
 Pubkey: deadbeefdeadbeefdeadbeef\n\n
 <raw message data>
 ```
 
-To send a message to the NPL write to FD 1 any data you desire, the HP controller will encode and transmit it to all connected peers and they will replicate it to their peers.
+To send a message to the NPL write to the 1st FD any data you desire, the HP controller will encode and transmit it to all connected peers and they will replicate it to their peers.
 
 
 ## Prototype Warning
