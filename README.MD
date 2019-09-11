@@ -95,4 +95,4 @@ This project is in a very early prototype. It definitely should not be used for 
  - gcc
  
 ## Usage
-An example contract is provided. To run it simply run `./run-test-contract` from linux or macos
+An example contract is provided. To run it simply run `./run-test-contract` from linux or macos. Warning: please download the RELEASE, not the latest commit to run this example, as the fdlist format has changed.
