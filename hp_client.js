@@ -12,8 +12,27 @@ sodium.ready.then(main).catch((e)=>{console.log(e)})
 function main() {
 
     var keys = sodium.crypto_sign_keypair()
-    var ws = new ws_api( (process.argv.length > 2 ? 'ws://localhost:' + 
-                          process.argv[2] : 'ws://localhost:8080'))
+    
+
+    // check for client keys
+    if (!fs.existsSync('.hp_client_keys')) {
+        keys.privateKey = sodium.to_hex(keys.privateKey)
+        keys.publicKey = sodium.to_hex(keys.publicKey)
+        fs.writeFileSync('.hp_client_keys', JSON.stringify(keys))
+    } else {
+        keys = JSON.parse(fs.readFileSync('.hp_client_keys'))
+        keys.privateKey = Uint8Array.from(Buffer.from(keys.privateKey, 'hex'))
+        keys.publicKey = Uint8Array.from(Buffer.from(keys.publicKey, 'hex'))
+    }
+
+
+    var server = 'ws://localhost:8080'
+
+    if (process.argv.length == 3) server = 'ws://localhost:' + process.argv[2]
+
+    if (process.argv.length == 4) server = 'ws://' + process.argv[2] + ':' + process.argv[3]
+
+    var ws = new ws_api( server )
 
     /* anatomy of a public challenge
        {
