@@ -1,6 +1,6 @@
 # Hot Pocket Prototype
 ## What is this?
-Hot Pocket (HP) is a consensus engine for Codius.
+Hot Pocket (HP) is a consensus engine for any collection of linux or mac machines and/or Codius.
 
 Given an arbitrary binary (i.e. virtually any program) HP will perform consensus on its inputs and state and outputs in a way that is user centric, building its own verifiable chain of executions to which each HP node in your network has agreed.
 
