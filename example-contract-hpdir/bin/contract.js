@@ -1,6 +1,3 @@
-process.on("uncaughtException", function(err){
-    console.log("Uncaught exception raised : " + err);
-});
 /**
     HpDir -- A Hot Pocket smart contract to provide directory services
              for other smart contracts
@@ -36,6 +33,9 @@ const fs = require('fs')
 const pipe = require('posix-pipe-fork-exec')
 
 var rom = Buffer.from(pipe.getfdbytes(0)).toString()
+
+console.log(rom)
+
 try {
     rom = JSON.parse(rom)
 } catch (e) {
@@ -49,6 +49,7 @@ for (var user in rom.user) {
     var fd = rom.user[user]    
 
     var input = Buffer.from(pipe.getfdbytes(fd[0])).toString()
+    
     console.log('user input: ' + input)
     if (input) {
         process_user_input(user, fd[0], fd[1], input)
@@ -70,6 +71,9 @@ function process_user_input(user, fdin, fdout, inp) {
     }
 
     if (!inp) return
+
+    if (inp.length > 300)
+        return error('total length of request must not exceed 300 characters')
 
     try {
         inp = JSON.parse(inp)
