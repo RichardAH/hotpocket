@@ -1442,8 +1442,7 @@ function consensus() {
             // if there's a fork condition we will either request history and state from 
             // our peers or we will halt depending on level of consensus on the sides of the fork
             
-            if (ram.consensus.stage < 3) 
-                proposal.lcl = ram.consensus.lcl
+            proposal.lcl = ram.consensus.lcl
 
 
             for (var i in proposals)
