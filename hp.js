@@ -36,8 +36,9 @@ function die(message, zero_exit) {
 // prints a warning
 
 function warn(message) {
-    if (ram.last_warn == message) return
+    if (ram.last_warn == message || ram.second_last_warn == message) return
     console.log("WARN: " + message)
+    ram.second_last_warn = ram.last_warn
     ram.last_warn = message
 }
 
@@ -501,7 +502,7 @@ function peer_connection_watchdog() {
         if (peer_ips[i]) delete peer_ips[i]
     }
 
-    dbg('peer connections ' + Object.keys(ram.peer_connections).length/2)
+    //dbg('peer connections ' + Object.keys(ram.peer_connections).length/2)
 
     // finally attempt new connections to anyone left on the list
     for (var i in peer_ips) {
@@ -863,7 +864,7 @@ function on_peer_connection(ws) {
 
             // todo: prune history aggressively to avoid crashing due to memory constraints
 
-            dbg('requested_lcl', requested_lcl)
+            //dbg('requested_lcl', requested_lcl)
 
             var history_files = fs.readdirSync(node.dir + '/hist')
             for (var file in history_files) {
@@ -1093,7 +1094,7 @@ function check_lcl_votes(lcl_votes) {
     {
         // potential fork condition
         //warn('no consensus on lcl, fatal. votes were: ' + JSON.stringify(lcl_votes)) 
-        warn('no consensus on lcl')
+        //warn('waiting for lcl consensus')
         return true
     }
 
@@ -1111,8 +1112,8 @@ function check_lcl_votes(lcl_votes) {
         var signed_history_request = sign_peer_message(request).signed
         send_to_random_peer(signed_history_request) 
         warn('we are not on the consensus ledger, requesting history from a random peer')
-        dbg('winning_lcl', winning_lcl)
-        dbg('our lcl', ram.consensus.lcl)
+        //dbg('winning_lcl', winning_lcl)
+        //dbg('our lcl', ram.consensus.lcl)
         return true
     }
 
@@ -1518,14 +1519,12 @@ function apply_ledger(proposal) {
             try {
                 output = Buffer.from(''+output, 'hex').toString()
             } catch (e) {
-                warn('output represented by hash ' + hash + ' for user ' + user + ' was not valid hex') 
+                warn('output represented by hash ' + hash + ' was not valid hex') 
                 continue
             } 
 
             // check if the user is in our locally connected users
             for (var j in ram.public_connections_authed) {
-                console.log(j)
-                console.log(user)
                 if (j.replace(/^.*;/, '') == user) {
                     // this is our locally connected user, send his contract output to him
                     ram.public_connections_authed[j].send(output)
