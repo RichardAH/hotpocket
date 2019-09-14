@@ -34,8 +34,11 @@ function die(message, zero_exit) {
 }
 
 // prints a warning
+
 function warn(message) {
+    if (ram.last_warn == message) return
     console.log("WARN: " + message)
+    ram.last_warn = message
 }
 
 // helper from https://stackoverflow.com/questions/56134298/is-there-a-way-to-get-all-keys-inside-of-an-object-including-sub-objects
@@ -507,12 +510,12 @@ function peer_connection_watchdog() {
         try {
             ws = new ws_api(url)
             ws.on('error', e=>{
-                warn('attempted to connect to peer ' + i + ' but could not connect')
-                warn(e)
+                //warn('attempted to connect to peer ' + i + ' but could not connect')
+                //warn(e)
             })
             ws.on('open',((w)=>{return ()=>{on_peer_connection(w)}})(ws))        
         } catch (e) {
-            warn('attempted to connect to peer ' + i + ':' + peer_ips[i] + ' but could not connect')
+           // warn('attempted to connect to peer ' + i + ':' + peer_ips[i] + ' but could not connect')
         }
     }
     
@@ -686,7 +689,7 @@ function prune_history_watchdog() {
 
 function on_peer_connection(ws) {
     //todo: filter to by ip ensure peer is on peer list
-    dbg('peer connected *****************************************')
+    //dbg('peer connected *****************************************')
     ram.peer_connections[ws._socket.remoteAddress + ":" + ws._socket.remotePort] = ws
     ws.on('message', (message)=> {
 
@@ -860,12 +863,14 @@ function on_peer_connection(ws) {
 
             // todo: prune history aggressively to avoid crashing due to memory constraints
 
+            dbg('requested_lcl', requested_lcl)
+
             var history_files = fs.readdirSync(node.dir + '/hist')
             for (var file in history_files) {
                 var json = ""
                 var raw = ""
                 try {
-                    json = JSON.parse(raw = fs.readFileSync( node.dir + '/hist/' + requested_lcl).toString())
+                    json = JSON.parse(raw = fs.readFileSync( node.dir + '/hist/' + history_files[file]).toString())
                 } catch (e)  {
                     warn('attempted to read history file ' + history_files[file] + ' but it didn\'t exist or wasn\'t valid JSON')
                     continue
@@ -875,10 +880,14 @@ function on_peer_connection(ws) {
                 history_raw[history_files[file]] = raw
             }
 
+            
             // swap keys with values in the history map
             history_map = swap_keys_for_values(history_map)
-            
+           
+ 
             // now history_map is llcl -> lcl
+
+            response.hist[requested_lcl] = history_raw[requested_lcl]
 
             while (history_map[requested_lcl]) {
                 // we found the history they were after, so attach it to the response and then 
@@ -889,10 +898,12 @@ function on_peer_connection(ws) {
                 requested_lcl = history_map[requested_lcl]
             } 
 
+
             // send any fetched history to the peer
             return ws.send(sign_peer_message(response).signed)
 
-        } else if (msg.type == 'hist_resp' && contains_keys(msg, 'hist_resp')) {
+        } else if (msg.type == 'hist_resp' && contains_keys(msg, 'hist')) {
+
 
             // first check if we actually asked anyone for history!
             if (!ram.consensus.last_history_request)
@@ -915,7 +926,7 @@ function on_peer_connection(ws) {
             received_history_raw = {}
             for (var lcl in msg.hist) {
                 try {
-                    received_history[lcl] = JSON.parse(received_history_raw[lcl] = Buffer.from(msg.hist[lcl], 'hex').toString()) 
+                    received_history[lcl] = JSON.parse(received_history_raw[lcl] = msg.hist[lcl]) 
                     received_history_map[lcl] = received_history[lcl].lcl
                 } catch(e) {
                     return warn('peer send us a history response which we asked for but contained invalid history ... hex or json would not parse')
@@ -1044,7 +1055,7 @@ function swap_keys_for_values(dict) {
 
 function wait_for_proposals(reset) {
     if (reset) ram.consensus.stage = 0
-    ram.consensus.nextsleep =  (sodium.randombytes_buf(1)[0]/256)*200// * node.roundtime 
+    ram.consensus.nextsleep =  1//(sodium.randombytes_buf(1)[0]/256)*200// * node.roundtime 
 }
 
 
@@ -1069,33 +1080,26 @@ function check_lcl_votes(lcl_votes) {
     }
 
     if (total_votes < node.unl.length * 0.8) {
-            if (ram.consensus.last_not_enough_peer_msg && 
-                time - ram.consensus.last_not_enough_peer_msg > 10) {
-                ram.consensus.last_not_enough_peer_msg = time
-                warn('not enough peers proposing to perform consensus (' + total_votes + ' out of ' + node.unl.length + 
-                     ', need ' + Math.ceil(node.unl.length*0.8) + ')')
-            }
-            return false
+        warn('not enough peers proposing to perform consensus')// (' + total_votes + ' out of ' + node.unl.length + 
+          //   ', need ' + Math.ceil(node.unl.length*0.8) + ')')
+        return true
     }
 
     var winning_lcl = key_of_highest_value(lcl_votes)
 
     var winning_votes = lcl_votes[winning_lcl]
 
-    if ( winning_votes / total_votes < 0.8) 
+    if ( winning_votes / node.unl.length < 0.8 ) // / total_votes < 0.8) 
     {
         // potential fork condition
-        if (ram.consensus.last_lcl_fatal &&
-            time - ram.consensus.last_lcl_fatal > 10) {
-            ram.consensus.last_lcl_fatal = time
-            warn('no consensus on lcl, fatal. votes were: ' + JSON.stringify(lcl_votes)) 
-        }
-        return false
+        //warn('no consensus on lcl, fatal. votes were: ' + JSON.stringify(lcl_votes)) 
+        warn('no consensus on lcl')
+        return true
     }
 
     // execution to here means the winning_lcl has 80%+ support
 
-    if (ram.consensus.lcl != proposal.lcl) {
+    if (ram.consensus.lcl != winning_lcl) {
 
         // create a history request
         request = {
@@ -1107,6 +1111,8 @@ function check_lcl_votes(lcl_votes) {
         var signed_history_request = sign_peer_message(request).signed
         send_to_random_peer(signed_history_request) 
         warn('we are not on the consensus ledger, requesting history from a random peer')
+        dbg('winning_lcl', winning_lcl)
+        dbg('our lcl', ram.consensus.lcl)
         return true
     }
 
@@ -1238,7 +1244,7 @@ function consensus() {
             proposal.timestamp = ts
             if (!ram.consensus.nprop[h]) {
                 ram.consensus.nprop[h] = true                
-                dbg('novel prop', proposal)
+                //dbg('novel prop', proposal)
             } //else console.log('sent same proposal again')
             
 
@@ -1294,14 +1300,13 @@ function consensus() {
                 return wait_for_proposals(time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000))
             } else if (winning_stage > ram.consensus.stage - 1) {
                 // we're behind consensus
-                console.log('wait for proposals 3b')
+                warn('wait for proposals 3b')
                 return wait_for_proposals(true)
             }
 
 
             if (check_lcl_votes(lcl_votes)) {
                 //dbg('consensus failure no lcl agreement, or simply no proposals')
-                console.log('wait for proposals 4')
                 return wait_for_proposals(time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000))
             }
 
@@ -1370,7 +1375,7 @@ function consensus() {
                     if (typeof(p.sta) == "object") {
                         if (p.stage > 0) {
                             warn("peer proposal attempted to propose a full state in a stage > 0")
-                            dbg('state', p)
+                            //dbg('state', p)
                         } else {
                             hash = SHA512H(JSON.stringify(p.sta, get_all_keys(p.sta)), 'STA')
                             ram.consensus.possible_state_dict[hash] = p.sta
@@ -1384,19 +1389,6 @@ function consensus() {
                 }
 
             }
-
-            // voting is according to specific rules
-            var total_votes = Object.keys(proposals).length
-            var total_possible_votes = node.unl.length
-
-            // firstly 80% of our peers must be online and voting before we will progress 
-            if (total_votes / total_possible_votes < 0.8) {
-                //warn('will not proceed until 80% of UNL peers are proposing -- have ' + total_votes + ' out of ' + total_possible_votes)
-                // copy proposals back into ram
-                //console.log('wait for proposals 5') 
-                return wait_for_proposals((time - ram.consensus.novel_proposal_time < Math.floor(node.roundtime/1000))) 
-            }
-
 
 
             // threshold the votes and build a new proposal
@@ -1449,10 +1441,10 @@ function consensus() {
             // we always vote for our current lcl regardless of what other peers are saying
             // if there's a fork condition we will either request history and state from 
             // our peers or we will halt depending on level of consensus on the sides of the fork
-            proposal.lcl = ram.consensus.lcl
+            
+            if (ram.consensus.stage < 3) 
+                proposal.lcl = ram.consensus.lcl
 
-
-            //proposal.sta = ""
 
             for (var i in proposals)
                 if (proposals[i].stage < ram.consensus.stage)
@@ -1466,7 +1458,7 @@ function consensus() {
 
 
             if (ram.consensus.stage == 3) {
-                dbg('lcl', proposal)
+                //dbg('lcl', proposal)
                 apply_ledger(proposal)
             }            
     }
@@ -1581,7 +1573,7 @@ function apply_ledger(proposal) {
 
                 request_state_from_peer()
 
-                console.log('wait for proposals 1')
+                warn('wait for proposals 1')
                 return wait_for_proposals(true)
             }
         } else {
@@ -1590,7 +1582,7 @@ function apply_ledger(proposal) {
             // state request from our peers before we can continue
 
             request_state_from_peer()
-            console.log('wait for proposals 2')
+            warn('wait for proposals 2')
             return wait_for_proposals(true)
         }
     }
@@ -1727,7 +1719,7 @@ function run_contract_binary() {
             return
         }
 
-        dbg('contract output: ' + Buffer.from(output).toString())
+        //dbg('contract output: ' + Buffer.from(output).toString())
 
         // execution to here means the contract has finished execution
         handle_state_after_execution()
