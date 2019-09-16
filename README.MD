@@ -1,8 +1,13 @@
 # Hot Pocket Prototype
+
+
 ## What is this?
 Hot Pocket (HP) is a consensus engine for any collection of linux or mac machines and/or Codius.
 
 Given an arbitrary binary (i.e. virtually any program) HP will perform consensus on its inputs and state and outputs in a way that is user centric, building its own verifiable chain of executions to which each HP node in your network has agreed.
+
+## Video Demo
+[![Hot Pocket Consensus Video Demo](https://img.youtube.com/vi/x323LE34XzA/0.jpg)](https://www.youtube.com/watch?v=x323LE34XzA)
 
 ## Smart Contract Interface
 The programmer (you) supplies a binary aka a smart contract (SC), around which you will build a HP network. Your network begins with a genesis ledger. Each consensus round between your nodes builds on the last ledger, forming a chain of ledgers. If a node leaves and rejoins it can re-enter consensus by catching up missing history and copying state from a peer.
