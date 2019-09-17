@@ -411,6 +411,8 @@ function load_contract() {
 
     for (var file in history_files) {
 
+        if (history_files[file].slice(0,1) == '.') continue
+
         // check if valid hex
         if (!history_files[file].match(/^[0-9a-f]{64}/)) {
             die('found ' + history_files[file] + ' in ' + node.dir + '/hist, however this is not a valid history filename')
