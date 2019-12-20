@@ -1,5 +1,7 @@
 # Hot Pocket Prototype
 
+## Warning! Prototype!
+**This is the original prototype of Hot Pocket, what you are looking for is the C++ production version please click here: [Hot Pocket Production Repository](https://github.com/HotPocketDev/core/)**
 
 ## What is this?
 Hot Pocket (HP) is a consensus engine for any collection of linux or mac machines and/or Codius.
